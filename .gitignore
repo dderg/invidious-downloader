@@ -1,0 +1,43 @@
+# Dependencies
+node_modules/
+
+# Deno
+.deno/
+
+# Build outputs
+dist/
+coverage/
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Videos storage (local development)
+videos/
+*.mp4
+*.m4a
+*.webm
+
+# Database files (local development)
+*.db
+*.db-journal
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+tmp/
+temp/

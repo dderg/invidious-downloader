@@ -1,0 +1,125 @@
+# Docker Compose example for Invidious Downloader
+#
+# This file shows how to run the complete stack:
+# - PostgreSQL database
+# - Invidious (YouTube frontend)
+# - Invidious Companion (video stream proxy)
+# - Invidious Downloader (this project)
+#
+# Usage:
+#   1. Copy this file to docker-compose.yml
+#   2. Update the secret keys and email
+#   3. Run: docker compose up -d
+#
+# Access the service at http://localhost:3001
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: invidious
+      POSTGRES_USER: kemal
+      POSTGRES_PASSWORD: kemal
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U kemal -d invidious"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  invidious:
+    image: quay.io/invidious/invidious:latest
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      INVIDIOUS_CONFIG: |
+        db:
+          dbname: invidious
+          user: kemal
+          password: kemal
+          host: postgres
+          port: 5432
+        check_tables: true
+        signature_server: companion:8282
+        visitor_data: companion:8282
+        po_token: companion:8282
+        companion: companion:8282
+        companion_key: "CHANGE_ME_SECRET_KEY"
+        # Disable external connections for video (we proxy through downloader)
+        # external_port: 443
+        # https_only: true
+    healthcheck:
+      test: wget -nv --tries=1 --spider http://127.0.0.1:3000/api/v1/stats || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  companion:
+    image: quay.io/invidious/invidious-companion:latest
+    restart: unless-stopped
+    environment:
+      SERVER_SECRET_KEY: "CHANGE_ME_SECRET_KEY"
+    healthcheck:
+      test: wget -nv --tries=1 --spider http://127.0.0.1:8282/health || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  downloader:
+    build: .
+    # Or use pre-built image:
+    # image: ghcr.io/your-username/invidious-downloader:latest
+    restart: unless-stopped
+    depends_on:
+      invidious:
+        condition: service_healthy
+      companion:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3001:3001"
+    environment:
+      # Required
+      INVIDIOUS_URL: "http://invidious:3000"
+      INVIDIOUS_DB_URL: "postgres://kemal:kemal@postgres:5432/invidious"
+      COMPANION_URL: "http://companion:8282"
+      COMPANION_SECRET: "CHANGE_ME_SECRET_KEY"
+      VIDEOS_PATH: "/videos"
+      
+      # Optional
+      PORT: "3001"
+      INVIDIOUS_USER: ""  # Set to specific user email to only watch their subscriptions
+      DOWNLOAD_QUALITY: "best"  # Options: best, 1080p, 720p, 480p, 360p
+      DOWNLOAD_RATE_LIMIT: "0"  # Bytes per second, 0 = unlimited
+      CHECK_INTERVAL_MINUTES: "30"  # How often to check for new videos
+      MAX_CONCURRENT_DOWNLOADS: "2"
+    volumes:
+      - videos:/videos
+    healthcheck:
+      test: wget -nv --tries=1 --spider http://127.0.0.1:3001/health || exit 1
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  videos:
+
+# Optional: External access configuration
+# If you want to expose the service externally, consider using a reverse proxy
+# like Traefik or nginx-proxy with SSL termination.
+#
+# Example with Traefik labels:
+#
+# downloader:
+#   labels:
+#     - "traefik.enable=true"
+#     - "traefik.http.routers.invidious.rule=Host(`youtube.example.com`)"
+#     - "traefik.http.routers.invidious.entrypoints=websecure"
+#     - "traefik.http.routers.invidious.tls.certresolver=letsencrypt"
+#     - "traefik.http.services.invidious.loadbalancer.server.port=3001"
