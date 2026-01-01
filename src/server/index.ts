@@ -121,6 +121,78 @@ export function createServer(deps: ServerDependencies): Server {
   app.route("/api/downloader", apiRouter);
 
   // ==========================================================================
+  // Watch Page Interception - Modify HTML for cached videos
+  // ==========================================================================
+
+  app.get("/watch", async (c: Context) => {
+    const url = new URL(c.req.url);
+    const videoId = url.searchParams.get("v");
+
+    // Validate video ID format
+    if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+      return proxy.proxy(c.req.raw);
+    }
+
+    // Check if video is cached
+    const isCached = await videoHandler.isCached(videoId);
+
+    if (!isCached) {
+      // Not cached, proxy normally
+      return proxy.proxy(c.req.raw);
+    }
+
+    console.log(`[watch] Video ${videoId} is cached, modifying HTML response`);
+
+    // Proxy to get original response
+    const proxyResult = await proxy.proxyRequest({ request: c.req.raw });
+
+    if (!proxyResult.ok) {
+      return proxy.proxy(c.req.raw);
+    }
+
+    const response = proxyResult.response;
+    const contentType = response.headers.get("content-type") || "";
+
+    // Only process HTML responses
+    if (!contentType.includes("text/html")) {
+      return response;
+    }
+
+    // Get HTML content
+    let html = await response.text();
+
+    // Build cached video URL
+    const protocol = c.req.header("x-forwarded-proto") || "http";
+    const host = c.req.header("host") || "localhost:3001";
+    const cachedUrl = `${protocol}://${host}/cached/${videoId}`;
+
+    // Replace the DASH source with direct MP4 source
+    // Original: <source src="/companion/api/manifest/dash/id/VIDEO_ID?..." type='application/dash+xml' label="dash">
+    // New: <source src="/cached/VIDEO_ID" type='video/mp4' label="cached">
+    const dashSourceRegex = new RegExp(
+      `<source\\s+src="/companion/api/manifest/dash/id/${videoId}[^"]*"\\s+type='application/dash\\+xml'[^>]*>`,
+      "g"
+    );
+    html = html.replace(dashSourceRegex, `<source src="${cachedUrl}" type='video/mp4' label="cached">`);
+
+    // Also update the player_data JSON to use cached URL in formatStreams
+    // and set quality to non-dash
+    const qualityDashRegex = /"quality":\s*"dash"/g;
+    html = html.replace(qualityDashRegex, '"quality": "medium"');
+
+    console.log(`[watch] Modified HTML for cached video ${videoId}`);
+
+    // Return modified HTML with same headers
+    const newHeaders = new Headers(response.headers);
+    newHeaders.delete("content-length"); // Length changed
+
+    return new Response(html, {
+      status: response.status,
+      headers: newHeaders,
+    });
+  });
+
+  // ==========================================================================
   // Video API Interception - Modify response for cached videos
   // ==========================================================================
 
@@ -179,9 +251,12 @@ export function createServer(deps: ServerDependencies): Server {
     const url = new URL(c.req.url);
     const videoId = url.searchParams.get("id");
 
+    console.log(`[latest_version] Request for video: ${videoId}`);
+
     // If we have a video ID and it's cached, serve from cache
     if (videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
       const isCached = await videoHandler.isCached(videoId);
+      console.log(`[latest_version] Video ${videoId} cached: ${isCached}, path: ${videoHandler.videosPath}/${videoId}.mp4`);
 
       if (isCached) {
         console.log(`[latest_version] Serving cached video: ${videoId}`);
@@ -191,11 +266,39 @@ export function createServer(deps: ServerDependencies): Server {
         if (result.ok) {
           return result.response;
         }
+        console.log(`[latest_version] Serve failed:`, result.error);
       }
     }
 
     // Not cached or error, proxy to Invidious
     return proxy.proxy(c.req.raw);
+  });
+
+  // ==========================================================================
+  // DASH Manifest - Intercept for cached videos
+  // ==========================================================================
+
+  app.get("/companion/api/manifest/dash/id/:videoId", async (c: Context) => {
+    const videoId = c.req.param("videoId");
+
+    // Validate video ID format
+    if (!videoId || !/^[a-zA-Z0-9_-]{11}$/.test(videoId)) {
+      return proxy.proxy(c.req.raw);
+    }
+
+    // Check if video is cached
+    const isCached = await videoHandler.isCached(videoId);
+
+    if (!isCached) {
+      console.log(`[dash-manifest] Video ${videoId} not cached, proxying`);
+      return proxy.proxy(c.req.raw);
+    }
+
+    // For cached videos, return 404 to force player to fall back to progressive playback
+    // The /api/v1/videos/:videoId endpoint already provides formatStreams with cached URL
+    // DASH doesn't work well with non-fragmented MP4 files
+    console.log(`[dash-manifest] Video ${videoId} is cached, returning 404 to force progressive playback`);
+    return c.json({ error: "DASH not available for cached videos" }, 404);
   });
 
   // ==========================================================================
