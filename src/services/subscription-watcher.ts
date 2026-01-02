@@ -43,7 +43,7 @@ export interface WatcherConfig {
  * Default watcher configuration.
  */
 export const DEFAULT_WATCHER_CONFIG: WatcherConfig = {
-  checkIntervalMs: 30 * 60 * 1000, // 30 minutes
+  checkIntervalMs: 5 * 60 * 1000, // 5 minutes
   userId: null,
   excludeLive: true,
   excludePremieres: true,
@@ -61,6 +61,8 @@ export interface WatcherState {
   videosQueuedTotal: number;
   checksCompleted: number;
   errors: WatcherError[];
+  /** Tracks the newest video timestamp we've seen - used for quick-check optimization */
+  lastSeenVideoTimestamp: Date | null;
 }
 
 /**
@@ -259,6 +261,7 @@ export function createSubscriptionWatcher(
     videosQueuedTotal: 0,
     checksCompleted: 0,
     errors: [],
+    lastSeenVideoTimestamp: null,
   };
   let intervalId: number | null = null;
   let publishedAfter: Date = fullConfig.publishedAfter ?? getDefaultPublishedAfter();
@@ -324,7 +327,31 @@ export function createSubscriptionWatcher(
         };
       }
 
-      // 2. Get latest videos from subscribed channels
+      // 2. Quick-check: See if there are any new videos since last check
+      // This is a cheap query that avoids the full check when nothing has changed
+      const maxPublishedResult = await deps.invidiousDb.getMaxPublishedTimestamp(channelIds);
+      if (maxPublishedResult.ok && maxPublishedResult.data) {
+        const maxPublished = maxPublishedResult.data;
+        
+        // If we've seen videos before and the newest video hasn't changed, skip full check
+        if (state.lastSeenVideoTimestamp && maxPublished <= state.lastSeenVideoTimestamp) {
+          const durationMs = Date.now() - startTime;
+          state = {
+            ...state,
+            lastCheckAt: new Date(),
+            lastCheckDurationMs: durationMs,
+          };
+          return {
+            ok: true,
+            videosFound: 0,
+            videosQueued: 0,
+            videosSkipped: 0,
+            durationMs,
+          };
+        }
+      }
+
+      // 3. Get latest videos from subscribed channels
       const options: LatestVideosOptions = {
         channelIds,
         publishedAfter,
@@ -350,7 +377,7 @@ export function createSubscriptionWatcher(
 
       const videos = videosResult.data;
 
-      // 3. Get existing data for filtering
+      // 4. Get existing data for filtering
       const downloadedIds = getDownloadedVideoIds(deps.localDb);
       const queuedIds = getQueuedVideoIds(deps.localDb);
       const excludedChannelsResult = deps.localDb.getExcludedChannelIds();
@@ -358,7 +385,7 @@ export function createSubscriptionWatcher(
         ? new Set(excludedChannelsResult.data)
         : new Set<string>();
 
-      // 4. Filter videos
+      // 5. Filter videos
       const filtered = filterVideos(
         videos,
         fullConfig,
@@ -367,11 +394,11 @@ export function createSubscriptionWatcher(
         excludedChannels,
       );
 
-      // 5. Sort and limit
+      // 6. Sort and limit
       const sorted = sortVideosByPriority(filtered.toQueue);
       const toQueue = sorted.slice(0, fullConfig.maxVideosPerCheck);
 
-      // 6. Add to queue
+      // 7. Add to queue
       let queued = 0;
       for (const video of toQueue) {
         const result = deps.localDb.addToQueue({
@@ -383,14 +410,24 @@ export function createSubscriptionWatcher(
         }
       }
 
-      // 7. Update state
+      // 8. Update state and track newest video timestamp
       const durationMs = Date.now() - startTime;
+      
+      // Find the newest video timestamp from this batch
+      let newestTimestamp = state.lastSeenVideoTimestamp;
+      for (const video of videos) {
+        if (!newestTimestamp || video.published > newestTimestamp) {
+          newestTimestamp = video.published;
+        }
+      }
+      
       state = {
         ...state,
         lastCheckAt: new Date(),
         lastCheckDurationMs: durationMs,
         videosQueuedTotal: state.videosQueuedTotal + queued,
         checksCompleted: state.checksCompleted + 1,
+        lastSeenVideoTimestamp: newestTimestamp,
       };
 
       // Update publishedAfter to now for next check

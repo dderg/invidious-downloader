@@ -231,6 +231,23 @@ export function buildGetChannelsQuery(ucids: string[]): {
   };
 }
 
+/**
+ * Build query to get the maximum published timestamp from channel videos.
+ * Used for quick-checking if any new videos exist.
+ */
+export function buildGetMaxPublishedQuery(channelIds: string[]): {
+  sql: string;
+  params: unknown[];
+} {
+  if (channelIds.length === 0) {
+    return { sql: "SELECT NULL as max_published", params: [] };
+  }
+  return {
+    sql: `SELECT MAX(published) as max_published FROM channel_videos WHERE ucid = ANY($1)`,
+    params: [channelIds],
+  };
+}
+
 // ============================================================================
 // Invidious Database Client
 // ============================================================================
@@ -363,6 +380,38 @@ export function createInvidiousDb(executor: SqlExecutor) {
   }
 
   /**
+   * Get the maximum published timestamp from videos of specified channels.
+   * Used for quick-checking if any new videos exist since last check.
+   */
+  async function getMaxPublishedTimestamp(
+    channelIds: string[],
+  ): Promise<DbResult<Date | null>> {
+    try {
+      if (channelIds.length === 0) {
+        return { ok: true, data: null };
+      }
+      const { sql, params } = buildGetMaxPublishedQuery(channelIds);
+      const row = await executor.queryOne(sql, params);
+      
+      if (!row || row.max_published === null) {
+        return { ok: true, data: null };
+      }
+      
+      const maxPublished = row.max_published instanceof Date
+        ? row.max_published
+        : new Date(String(row.max_published));
+      
+      return { ok: true, data: maxPublished };
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to get max published timestamp: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
    * Close the database connection.
    */
   async function close(): Promise<void> {
@@ -376,6 +425,7 @@ export function createInvidiousDb(executor: SqlExecutor) {
     getLatestVideos,
     getChannel,
     getChannels,
+    getMaxPublishedTimestamp,
     close,
   };
 }

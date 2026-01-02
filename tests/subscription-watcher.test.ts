@@ -322,6 +322,7 @@ describe("createSubscriptionWatcher", () => {
       getChannel: async () => ({ ok: false, error: { type: "not_found", message: "Not found" } }),
       getChannels: async () => ({ ok: true, data: [] }),
       getLatestVideos: async () => ({ ok: true, data: [] }),
+      getMaxPublishedTimestamp: async () => ({ ok: true, data: null }),
       close: async () => {},
       ...overrides,
     };
@@ -372,6 +373,7 @@ describe("createSubscriptionWatcher", () => {
       assertEquals(state.videosQueuedTotal, 0);
       assertEquals(state.checksCompleted, 0);
       assertEquals(state.errors.length, 0);
+      assertEquals(state.lastSeenVideoTimestamp, null);
     });
   });
 
@@ -599,6 +601,163 @@ describe("createSubscriptionWatcher", () => {
       const specificDate = new Date("2024-01-01");
       watcher.resetPublishedAfter(specificDate);
       // No direct way to verify, but should not throw
+    });
+  });
+
+  describe("quick-check optimization", () => {
+    it("should skip full check when no new videos since last check", async () => {
+      const testVideos: ChannelVideo[] = [
+        createTestVideo({ id: "video1111111", published: new Date("2024-01-15T10:00:00Z") }),
+      ];
+
+      let latestVideosCalled = 0;
+      const watcher = createSubscriptionWatcher({
+        invidiousDb: createMockInvidiousDb({
+          getAllUsers: async () => ({
+            ok: true,
+            data: [{ email: "test@example.com", subscriptions: ["UCtest1111"] }],
+          }),
+          getLatestVideos: async () => {
+            latestVideosCalled++;
+            return { ok: true, data: testVideos };
+          },
+          getMaxPublishedTimestamp: async () => ({
+            ok: true,
+            data: new Date("2024-01-15T10:00:00Z"),
+          }),
+        }),
+        localDb: createMockLocalDb(),
+      });
+
+      // First check should process videos
+      await watcher.triggerCheck();
+      assertEquals(latestVideosCalled, 1);
+      assertEquals(watcher.getState().lastSeenVideoTimestamp?.getTime(), new Date("2024-01-15T10:00:00Z").getTime());
+
+      // Second check should skip (same max timestamp)
+      await watcher.triggerCheck();
+      assertEquals(latestVideosCalled, 1); // Should NOT have increased
+    });
+
+    it("should do full check when newer videos exist", async () => {
+      const testVideos: ChannelVideo[] = [
+        createTestVideo({ id: "video1111111", published: new Date("2024-01-15T10:00:00Z") }),
+      ];
+      const newerVideos: ChannelVideo[] = [
+        createTestVideo({ id: "video2222222", published: new Date("2024-01-16T10:00:00Z") }),
+      ];
+
+      let latestVideosCalled = 0;
+      let maxTimestamp = new Date("2024-01-15T10:00:00Z");
+
+      const watcher = createSubscriptionWatcher({
+        invidiousDb: createMockInvidiousDb({
+          getAllUsers: async () => ({
+            ok: true,
+            data: [{ email: "test@example.com", subscriptions: ["UCtest1111"] }],
+          }),
+          getLatestVideos: async () => {
+            latestVideosCalled++;
+            return { ok: true, data: latestVideosCalled === 1 ? testVideos : newerVideos };
+          },
+          getMaxPublishedTimestamp: async () => ({
+            ok: true,
+            data: maxTimestamp,
+          }),
+        }),
+        localDb: createMockLocalDb(),
+      });
+
+      // First check
+      await watcher.triggerCheck();
+      assertEquals(latestVideosCalled, 1);
+
+      // Simulate Invidious finding a new video
+      maxTimestamp = new Date("2024-01-16T10:00:00Z");
+
+      // Second check should process (newer max timestamp)
+      await watcher.triggerCheck();
+      assertEquals(latestVideosCalled, 2);
+    });
+
+    it("should do full check on first run (no lastSeenVideoTimestamp)", async () => {
+      const testVideos: ChannelVideo[] = [
+        createTestVideo({ id: "video1111111", published: new Date("2024-01-15T10:00:00Z") }),
+      ];
+
+      let latestVideosCalled = 0;
+      const watcher = createSubscriptionWatcher({
+        invidiousDb: createMockInvidiousDb({
+          getAllUsers: async () => ({
+            ok: true,
+            data: [{ email: "test@example.com", subscriptions: ["UCtest1111"] }],
+          }),
+          getLatestVideos: async () => {
+            latestVideosCalled++;
+            return { ok: true, data: testVideos };
+          },
+          getMaxPublishedTimestamp: async () => ({
+            ok: true,
+            data: new Date("2024-01-15T10:00:00Z"),
+          }),
+        }),
+        localDb: createMockLocalDb(),
+      });
+
+      // First check should always do full check
+      assertEquals(watcher.getState().lastSeenVideoTimestamp, null);
+      await watcher.triggerCheck();
+      assertEquals(latestVideosCalled, 1);
+    });
+
+    it("should update lastSeenVideoTimestamp after successful check", async () => {
+      const videoDate = new Date("2024-01-20T15:30:00Z");
+      const testVideos: ChannelVideo[] = [
+        createTestVideo({ id: "video1111111", published: videoDate }),
+      ];
+
+      const watcher = createSubscriptionWatcher({
+        invidiousDb: createMockInvidiousDb({
+          getAllUsers: async () => ({
+            ok: true,
+            data: [{ email: "test@example.com", subscriptions: ["UCtest1111"] }],
+          }),
+          getLatestVideos: async () => ({ ok: true, data: testVideos }),
+          getMaxPublishedTimestamp: async () => ({ ok: true, data: videoDate }),
+        }),
+        localDb: createMockLocalDb(),
+      });
+
+      await watcher.triggerCheck();
+      const state = watcher.getState();
+
+      assertEquals(state.lastSeenVideoTimestamp?.getTime(), videoDate.getTime());
+    });
+
+    it("should handle getMaxPublishedTimestamp returning null gracefully", async () => {
+      const testVideos: ChannelVideo[] = [
+        createTestVideo({ id: "video1111111" }),
+      ];
+
+      let latestVideosCalled = 0;
+      const watcher = createSubscriptionWatcher({
+        invidiousDb: createMockInvidiousDb({
+          getAllUsers: async () => ({
+            ok: true,
+            data: [{ email: "test@example.com", subscriptions: ["UCtest1111"] }],
+          }),
+          getLatestVideos: async () => {
+            latestVideosCalled++;
+            return { ok: true, data: testVideos };
+          },
+          getMaxPublishedTimestamp: async () => ({ ok: true, data: null }),
+        }),
+        localDb: createMockLocalDb(),
+      });
+
+      // Should still do full check when max timestamp is null
+      await watcher.triggerCheck();
+      assertEquals(latestVideosCalled, 1);
     });
   });
 });

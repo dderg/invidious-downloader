@@ -103,7 +103,7 @@ export function parseConfig(input: ConfigInput): ConfigResult {
   const checkIntervalMinutes = parsePositiveInt(
     input.CHECK_INTERVAL_MINUTES,
     "CHECK_INTERVAL_MINUTES",
-    30,
+    5,
   );
   if (checkIntervalMinutes.error) {
     errors.push(checkIntervalMinutes.error);

@@ -4,6 +4,7 @@ import {
   buildGetAllUsersQuery,
   buildGetChannelQuery,
   buildGetChannelsQuery,
+  buildGetMaxPublishedQuery,
   buildGetUserQuery,
   buildLatestVideosQuery,
   createInvidiousDb,
@@ -286,6 +287,23 @@ describe("buildGetChannelsQuery", () => {
   });
 });
 
+describe("buildGetMaxPublishedQuery", () => {
+  it("should build correct query with channel IDs", () => {
+    const { sql, params } = buildGetMaxPublishedQuery(["UC123", "UC456"]);
+    assertEquals(
+      sql,
+      "SELECT MAX(published) as max_published FROM channel_videos WHERE ucid = ANY($1)",
+    );
+    assertEquals(params, [["UC123", "UC456"]]);
+  });
+
+  it("should return NULL query for empty channel list", () => {
+    const { sql, params } = buildGetMaxPublishedQuery([]);
+    assertEquals(sql, "SELECT NULL as max_published");
+    assertEquals(params, []);
+  });
+});
+
 // ============================================================================
 // InvidiousDb Client Tests
 // ============================================================================
@@ -439,6 +457,66 @@ describe("createInvidiousDb", () => {
       assertEquals(result.ok, true);
       if (result.ok) {
         assertEquals(result.data, []);
+      }
+    });
+  });
+
+  describe("getMaxPublishedTimestamp", () => {
+    it("should return max timestamp when videos exist", async () => {
+      const testDate = new Date("2024-06-15T12:00:00Z");
+      const executor = createMockExecutor([{ max_published: testDate }]);
+      const db = createInvidiousDb(executor);
+
+      const result = await db.getMaxPublishedTimestamp(["UC123", "UC456"]);
+      assertEquals(result.ok, true);
+      if (result.ok) {
+        assertEquals(result.data instanceof Date, true);
+        assertEquals(result.data?.getTime(), testDate.getTime());
+      }
+    });
+
+    it("should return null when no videos exist", async () => {
+      const executor = createMockExecutor([{ max_published: null }]);
+      const db = createInvidiousDb(executor);
+
+      const result = await db.getMaxPublishedTimestamp(["UC123"]);
+      assertEquals(result.ok, true);
+      if (result.ok) {
+        assertEquals(result.data, null);
+      }
+    });
+
+    it("should return null for empty channel list", async () => {
+      const executor = createMockExecutor([]);
+      const db = createInvidiousDb(executor);
+
+      const result = await db.getMaxPublishedTimestamp([]);
+      assertEquals(result.ok, true);
+      if (result.ok) {
+        assertEquals(result.data, null);
+      }
+    });
+
+    it("should handle string date format", async () => {
+      const executor = createMockExecutor([{ max_published: "2024-06-15T12:00:00Z" }]);
+      const db = createInvidiousDb(executor);
+
+      const result = await db.getMaxPublishedTimestamp(["UC123"]);
+      assertEquals(result.ok, true);
+      if (result.ok) {
+        assertEquals(result.data instanceof Date, true);
+      }
+    });
+
+    it("should return query_error on exception", async () => {
+      const executor = createMockExecutor([], new Error("Connection failed"));
+      const db = createInvidiousDb(executor);
+
+      const result = await db.getMaxPublishedTimestamp(["UC123"]);
+      assertEquals(result.ok, false);
+      if (!result.ok) {
+        assertEquals(result.error.type, "query_error");
+        assertEquals(result.error.message.includes("max published timestamp"), true);
       }
     });
   });
