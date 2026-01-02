@@ -149,6 +149,7 @@ async function main(): Promise<void> {
     config,
     db: localDb,
     downloadManager,
+    muxer,
   });
 
   const httpServer = Deno.serve(

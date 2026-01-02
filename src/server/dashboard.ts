@@ -7,7 +7,7 @@
 
 import type { LocalDbClient } from "../db/local-db.ts";
 import type { DownloadManager } from "../services/download-manager.ts";
-import { renderDashboardPage, type DashboardData } from "./templates.ts";
+import { renderDashboardPage, type DashboardData, type DownloadWithStatus } from "./templates.ts";
 import type { DashboardStats } from "./ws-manager.ts";
 
 // ============================================================================
@@ -20,13 +20,29 @@ export interface DashboardDependencies {
 }
 
 // ============================================================================
+// Helpers
+// ============================================================================
+
+/**
+ * Check if a file exists.
+ */
+async function fileExists(path: string): Promise<boolean> {
+  try {
+    await Deno.stat(path);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ============================================================================
 // Dashboard Data Fetcher
 // ============================================================================
 
 /**
  * Fetch all data needed for the dashboard.
  */
-export function getDashboardData(deps: DashboardDependencies): DashboardData {
+export async function getDashboardData(deps: DashboardDependencies): Promise<DashboardData> {
   const { db, downloadManager } = deps;
 
   // Get stats
@@ -52,7 +68,15 @@ export function getDashboardData(deps: DashboardDependencies): DashboardData {
   // Get downloads (first page)
   const limit = 20;
   const downloadsResult = db.getDownloads({ limit, offset: 0, orderBy: "downloadedAt", orderDir: "desc" });
-  const downloads = downloadsResult.ok ? downloadsResult.data : [];
+  const rawDownloads = downloadsResult.ok ? downloadsResult.data : [];
+  
+  // Check if MP4 exists for each download
+  const downloads: DownloadWithStatus[] = await Promise.all(
+    rawDownloads.map(async (item) => ({
+      ...item,
+      hasMuxedFile: await fileExists(item.filePath),
+    }))
+  );
   
   // Get total downloads count
   const countResult = db.getDownloadsCount({});
@@ -74,7 +98,7 @@ export function getDashboardData(deps: DashboardDependencies): DashboardData {
 /**
  * Generate the full dashboard HTML page.
  */
-export function generateDashboardHtml(deps: DashboardDependencies): string {
-  const data = getDashboardData(deps);
+export async function generateDashboardHtml(deps: DashboardDependencies): Promise<string> {
+  const data = await getDashboardData(deps);
   return renderDashboardPage(data);
 }

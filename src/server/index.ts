@@ -15,6 +15,7 @@ import { cors } from "@hono/hono/cors";
 import type { Config } from "../config.ts";
 import type { LocalDbClient } from "../db/local-db.ts";
 import type { DownloadManager } from "../services/download-manager.ts";
+import type { Muxer } from "../services/muxer.ts";
 
 import { createProxy, type Proxy, type HttpFetcher } from "./proxy.ts";
 import { createVideoHandler, type VideoHandler, type VideoFileSystem, extractVideoIdFromPath, buildVideoStreamPath, buildAudioStreamPath } from "./video-handler.ts";
@@ -154,6 +155,7 @@ export interface ServerDependencies {
   config: Config;
   db: LocalDbClient;
   downloadManager?: DownloadManager;
+  muxer?: Muxer;
   /** Optional custom HTTP fetcher for proxy */
   httpFetcher?: HttpFetcher;
   /** Optional custom file system for video handler */
@@ -180,7 +182,7 @@ export interface Server {
  * Create the HTTP server.
  */
 export function createServer(deps: ServerDependencies): Server {
-  const { config, db, downloadManager, httpFetcher, videoFileSystem } = deps;
+  const { config, db, downloadManager, muxer, httpFetcher, videoFileSystem } = deps;
 
   // Create components
   const proxy = createProxy(
@@ -211,7 +213,7 @@ export function createServer(deps: ServerDependencies): Server {
   // API Routes
   // ==========================================================================
 
-  const apiRouter = createApiRouter({ db, downloadManager });
+  const apiRouter = createApiRouter({ db, downloadManager, muxer, videosPath: config.videosPath });
   app.route("/api/downloader", apiRouter);
 
   // ==========================================================================
@@ -609,8 +611,8 @@ export function createServer(deps: ServerDependencies): Server {
     return c.redirect("/downloader/");
   });
 
-  app.get("/downloader/", (c: Context) => {
-    const html = generateDashboardHtml({ db, downloadManager });
+  app.get("/downloader/", async (c: Context) => {
+    const html = await generateDashboardHtml({ db, downloadManager });
     return c.html(html);
   });
 

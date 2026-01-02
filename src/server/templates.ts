@@ -10,6 +10,17 @@ import type { QueueItem, Download } from "../db/types.ts";
 import type { DashboardStats } from "./ws-manager.ts";
 
 // ============================================================================
+// Extended Types
+// ============================================================================
+
+/**
+ * Download with optional runtime status info.
+ */
+export interface DownloadWithStatus extends Download {
+  hasMuxedFile?: boolean;
+}
+
+// ============================================================================
 // Utility Functions
 // ============================================================================
 
@@ -27,9 +38,9 @@ export function formatBytes(bytes: number): string {
 /**
  * Format date to locale string.
  */
-export function formatDate(dateStr: string): string {
-  const date = new Date(dateStr);
-  return date.toLocaleDateString() + " " + date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+export function formatDate(date: string | Date): string {
+  const dateObj = typeof date === 'string' ? new Date(date) : date;
+  return dateObj.toLocaleDateString() + " " + dateObj.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
 /**
@@ -49,6 +60,7 @@ export function getPhaseLabel(phase: string): string {
     "downloading_video": "Downloading video",
     "downloading_audio": "Downloading audio",
     "muxing": "Muxing...",
+    "finalizing": "Finalizing...",
     "queued": "Queued",
   };
   return labels[phase] || phase;
@@ -116,7 +128,7 @@ export function renderQueueList(items: QueueItem[], progress: Map<string, Active
  */
 export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgress): string {
   const phase = progress?.phase ?? item.status;
-  const title = escapeHtml(progress?.title || item.title || item.videoId);
+  const title = escapeHtml(progress?.title || item.videoId);
   const isActive = item.status === "downloading" || item.status === "muxing";
   
   let progressHtml = "";
@@ -124,7 +136,6 @@ export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgre
     progressHtml = renderProgressSection(item.videoId, progress);
   }
 
-  const channelTitle = escapeHtml(item.channelTitle || "Unknown channel");
   const errorHtml = item.errorMessage 
     ? `&bull; <span style="color: var(--error)">${escapeHtml(item.errorMessage)}</span>` 
     : "";
@@ -137,8 +148,7 @@ export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgre
   <div class="item-info">
     <div class="item-title">${title}</div>
     <div class="item-meta">
-      ${channelTitle}
-      &bull; Added ${formatDate(item.queuedAt)}
+      Added ${formatDate(item.queuedAt)}
       ${errorHtml}
     </div>
     ${progressHtml}
@@ -279,17 +289,36 @@ ${oob ? `<span id="downloads-count" hx-swap-oob="innerHTML">${pagination.total} 
 /**
  * Render a single download item.
  */
-export function renderDownloadItem(item: Download): string {
+export function renderDownloadItem(item: DownloadWithStatus): string {
   const title = escapeHtml(item.title || item.videoId);
-  const channelTitle = escapeHtml(item.channelTitle || "Unknown");
+  const channelTitle = escapeHtml(item.metadata?.author || "Unknown");
+  const hasMuxedFile = item.hasMuxedFile ?? true; // Default to true for backwards compatibility
+
+  // Create MP4 button - only shown when MP4 doesn't exist
+  const createMp4Button = hasMuxedFile 
+    ? ""
+    : `<button 
+        class="secondary" 
+        hx-post="/api/downloader/downloads/${item.videoId}/mux" 
+        hx-swap="none"
+        hx-indicator="#mux-indicator-${item.videoId}"
+        hx-disabled-elt="this">
+        <span class="htmx-indicator" id="mux-indicator-${item.videoId}">Creating...</span>
+        <span class="button-text">Create MP4</span>
+      </button>`;
+
+  // MP4 indicator badge
+  const mp4Badge = hasMuxedFile 
+    ? `<span class="badge badge-mp4" title="MP4 available">MP4</span>` 
+    : `<span class="badge badge-dash" title="DASH streams only">DASH</span>`;
 
   return `
-<li class="download-item">
+<li class="download-item" id="download-${item.videoId}">
   <div class="item-thumbnail">
     <img src="${getThumbnailUrl(item.videoId)}" alt="" loading="lazy">
   </div>
   <div class="item-info">
-    <div class="item-title">${title}</div>
+    <div class="item-title">${title} ${mp4Badge}</div>
     <div class="item-meta">
       ${channelTitle}
       &bull; ${formatBytes(item.fileSizeBytes || 0)}
@@ -298,6 +327,7 @@ export function renderDownloadItem(item: Download): string {
   </div>
   <div class="item-actions">
     <button class="secondary" onclick="window.open('/watch?v=${item.videoId}', '_blank')">Watch</button>
+    ${createMp4Button}
     <button class="secondary danger" hx-delete="/api/downloader/downloads/${item.videoId}" hx-swap="none" hx-confirm="Delete this video? This cannot be undone.">Delete</button>
   </div>
 </li>`;
@@ -336,7 +366,7 @@ export interface DashboardData {
   stats: DashboardStats;
   queue: QueueItem[];
   progress: Map<string, ActiveDownloadProgress>;
-  downloads: Download[];
+  downloads: DownloadWithStatus[];
   downloadsPagination: Pagination;
 }
 
@@ -604,6 +634,40 @@ export function renderDashboardPage(data: DashboardData): string {
     .status-cancelled { background: var(--border); color: var(--text); }
     .status-muxing { background: #9c27b0; color: #fff; }
     
+    /* Badges for MP4/DASH status */
+    .badge {
+      display: inline-block;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-left: 8px;
+      vertical-align: middle;
+    }
+    
+    .badge-mp4 {
+      background: var(--success);
+      color: #000;
+    }
+    
+    .badge-dash {
+      background: var(--accent);
+      color: #fff;
+    }
+    
+    /* HTMX loading indicator for Create MP4 button */
+    .htmx-indicator {
+      display: none;
+    }
+    
+    .htmx-request .htmx-indicator {
+      display: inline;
+    }
+    
+    .htmx-request .button-text {
+      display: none;
+    }
+    
     .item-actions {
       display: flex;
       gap: 8px;
@@ -818,7 +882,7 @@ export function renderDashboardPage(data: DashboardData): string {
         </span>
       </div>
       <div id="downloads-container">
-        <ul class="downloads-list" id="downloads-list">${downloadsContent}</ul>
+        <ul class="downloads-list" id="downloads-list" hx-get="/api/downloader/downloads-html?page=1&limit=20" hx-trigger="refresh" hx-swap="innerHTML">${downloadsContent}</ul>
       </div>
       <div id="downloads-pagination">
         ${renderPagination(downloadsPagination)}
@@ -892,6 +956,31 @@ export function renderDashboardPage(data: DashboardData): string {
       }
       
       return input; // Return as-is, let server validate
+    }
+    
+    // Handle Create MP4 button responses
+    document.body.addEventListener('htmx:afterRequest', function(e) {
+      // Check if this was a mux request
+      if (e.detail.pathInfo && e.detail.pathInfo.requestPath.includes('/mux')) {
+        const videoId = e.detail.pathInfo.requestPath.match(/downloads\\/([^/]+)\\/mux/)?.[1];
+        if (videoId && e.detail.successful) {
+          // Refresh the downloads list to show updated status
+          htmx.trigger('#downloads-list', 'refresh');
+          // Show success toast
+          showToast('MP4 created successfully!', 'success');
+        } else if (!e.detail.successful) {
+          showToast('Failed to create MP4', 'error');
+        }
+      }
+    });
+    
+    // Helper to show toast messages
+    function showToast(message, type) {
+      const toast = document.createElement('div');
+      toast.className = 'toast toast-' + type;
+      toast.textContent = message;
+      toast.dataset.autoDismiss = 'true';
+      document.getElementById('toast-container').appendChild(toast);
     }
   </script>
 </body>

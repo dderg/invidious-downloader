@@ -9,6 +9,7 @@
  * - GET  /api/downloader/downloads   - List downloads
  * - GET  /api/downloader/downloads/:id - Get download details
  * - DELETE /api/downloader/downloads/:id - Delete download
+ * - POST /api/downloader/downloads/:id/mux - Create muxed MP4 from streams
  * - GET  /api/downloader/downloads-html - List downloads as HTML (for HTMX)
  * - GET  /api/downloader/exclusions  - List exclusions
  * - POST /api/downloader/exclusions  - Add exclusion
@@ -18,8 +19,10 @@
 import { Hono, type Context } from "@hono/hono";
 import type { LocalDbClient } from "../db/local-db.ts";
 import type { DownloadManager } from "../services/download-manager.ts";
-import type { QueueStatus } from "../db/types.ts";
+import type { Muxer } from "../services/muxer.ts";
+import type { QueueStatus, Download } from "../db/types.ts";
 import { renderDownloadsList, renderDownloadItem, renderPagination } from "./templates.ts";
+import { getAudioExtension } from "../services/download-manager.ts";
 
 // ============================================================================
 // Types
@@ -31,6 +34,8 @@ import { renderDownloadsList, renderDownloadItem, renderPagination } from "./tem
 export interface ApiDependencies {
   db: LocalDbClient;
   downloadManager?: DownloadManager;
+  muxer?: Muxer;
+  videosPath?: string;
 }
 
 /**
@@ -68,10 +73,29 @@ export interface ExclusionRequestBody {
 // ============================================================================
 
 /**
+ * Extended Download type with runtime status info.
+ */
+export interface DownloadWithStatus extends Download {
+  hasMuxedFile: boolean;
+}
+
+/**
+ * Helper to check if muxed MP4 file exists for a download.
+ */
+async function checkMuxedFileExists(filePath: string): Promise<boolean> {
+  try {
+    await Deno.stat(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Create the API router.
  */
 export function createApiRouter(deps: ApiDependencies) {
-  const { db, downloadManager } = deps;
+  const { db, downloadManager, muxer, videosPath } = deps;
   const startTime = Date.now();
 
   const api = new Hono();
@@ -353,6 +377,101 @@ export function createApiRouter(deps: ApiDependencies) {
     });
   });
 
+  // Create muxed MP4 from streams
+  api.post("/downloads/:videoId/mux", async (c: Context) => {
+    const videoId = c.req.param("videoId");
+
+    // Check if muxer is available
+    if (!muxer) {
+      return c.json({ error: "Muxer not available" }, 503);
+    }
+
+    if (!videosPath) {
+      return c.json({ error: "Videos path not configured" }, 503);
+    }
+
+    // Get download info from DB
+    const downloadResult = db.getDownload(videoId);
+    if (!downloadResult.ok) {
+      return c.json({ error: downloadResult.error.message }, 500);
+    }
+
+    if (!downloadResult.data) {
+      return c.json({ error: "Download not found" }, 404);
+    }
+
+    const download = downloadResult.data;
+    const metadata = download.metadata;
+
+    // Check if MP4 already exists
+    const outputPath = `${videosPath}/${videoId}.mp4`;
+    try {
+      await Deno.stat(outputPath);
+      return c.json({ error: "MP4 already exists" }, 409);
+    } catch {
+      // File doesn't exist, continue
+    }
+
+    // Get itags from metadata
+    const videoItag = metadata.videoItag;
+    const audioItag = metadata.audioItag;
+
+    if (!videoItag || !audioItag) {
+      return c.json({ error: "Missing video or audio itag in metadata" }, 400);
+    }
+
+    // Determine audio extension
+    const audioExtension = metadata.audioExtension || getAudioExtension(metadata.audioMimeType);
+
+    // Build stream paths
+    const videoStreamPath = `${videosPath}/${videoId}_video_${videoItag}.mp4`;
+    const audioStreamPath = `${videosPath}/${videoId}_audio_${audioItag}.${audioExtension}`;
+
+    // Check if streams exist
+    try {
+      await Deno.stat(videoStreamPath);
+    } catch {
+      return c.json({ error: `Video stream not found: ${videoStreamPath}` }, 404);
+    }
+
+    try {
+      await Deno.stat(audioStreamPath);
+    } catch {
+      return c.json({ error: `Audio stream not found: ${audioStreamPath}` }, 404);
+    }
+
+    // Mux the streams
+    console.log(`[api] Muxing ${videoId}: ${videoStreamPath} + ${audioStreamPath} -> ${outputPath}`);
+    
+    const muxResult = await muxer.mux({
+      videoPath: videoStreamPath,
+      audioPath: audioStreamPath,
+      outputPath,
+    });
+
+    if (!muxResult.ok) {
+      console.error(`[api] Muxing failed for ${videoId}:`, muxResult.error);
+      return c.json({ error: `Muxing failed: ${muxResult.error.message}` }, 500);
+    }
+
+    // Get file size
+    let fileSizeBytes = 0;
+    try {
+      const stat = await Deno.stat(outputPath);
+      fileSizeBytes = stat.size;
+    } catch {
+      // Ignore
+    }
+
+    console.log(`[api] Muxing complete for ${videoId}: ${fileSizeBytes} bytes`);
+
+    return c.json({
+      success: true,
+      filePath: outputPath,
+      fileSizeBytes,
+    });
+  });
+
   // ==========================================================================
   // Exclusions
   // ==========================================================================
@@ -489,10 +608,18 @@ export function createApiRouter(deps: ApiDependencies) {
 
     const pagination = { page, limit, total };
 
+    // Check MP4 existence for each download
+    const itemsWithStatus: DownloadWithStatus[] = await Promise.all(
+      result.data.map(async (item) => ({
+        ...item,
+        hasMuxedFile: await checkMuxedFileExists(item.filePath),
+      }))
+    );
+
     // Return just the list items and pagination for HTMX swap
-    const itemsHtml = result.data.length === 0
+    const itemsHtml = itemsWithStatus.length === 0
       ? `<li class="empty-state">No downloaded videos yet</li>`
-      : result.data.map(item => renderDownloadItem(item)).join("");
+      : itemsWithStatus.map(item => renderDownloadItem(item)).join("");
 
     const paginationHtml = renderPagination(pagination);
 

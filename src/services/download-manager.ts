@@ -22,7 +22,7 @@ import type { DownloadMetadata } from "../db/types.ts";
  */
 export interface DownloadProgress {
   videoId: string;
-  phase: "downloading" | "muxing" | "complete" | "failed";
+  phase: "downloading" | "muxing" | "finalizing" | "complete" | "failed";
   // Video stream progress
   videoBytesDownloaded: number;
   videoTotalBytes: number | null;
@@ -94,7 +94,7 @@ interface ActiveDownload {
 export interface ActiveDownloadProgress {
   videoId: string;
   title: string;
-  phase: "downloading" | "muxing" | "queued";
+  phase: "downloading" | "muxing" | "finalizing" | "queued";
   // Video stream progress
   videoBytesDownloaded: number;
   videoTotalBytes: number | null;
@@ -581,10 +581,11 @@ export function createDownloadManager(
           };
         }
 
-        // Mux video and audio
+        // Move temp streams to itag-based paths for DASH streaming (no auto-muxing)
+        // MP4 muxing is done on-demand via dashboard button
         onProgress({
           videoId: videoInfo.videoId,
-          phase: "muxing",
+          phase: "finalizing",
           videoBytesDownloaded: videoResult.size,
           videoTotalBytes: videoResult.size,
           videoPercentage: 100,
@@ -595,49 +596,40 @@ export function createDownloadManager(
           audioSpeed: null,
         });
 
-        const muxResult = await muxer.mux({
-          videoPath: paths.videoPath,
-          audioPath: paths.audioPath,
-          outputPath: paths.outputPath,
-        });
-
-        // Before cleaning up temp files, copy them to itag-based paths for DASH streaming
+        // Move temp files to itag-based paths (more efficient than copy)
         if (paths.videoItagPath) {
           try {
-            // Copy video stream to itag-based path
-            const videoData = await Deno.readFile(paths.videoPath);
-            await Deno.writeFile(paths.videoItagPath, videoData);
+            await Deno.rename(paths.videoPath, paths.videoItagPath);
           } catch (e) {
-            console.warn(`[download] Failed to save video stream: ${e instanceof Error ? e.message : e}`);
+            console.warn(`[download] Failed to move video stream: ${e instanceof Error ? e.message : e}`);
+            // Fallback to copy if rename fails (e.g., cross-device)
+            try {
+              const videoData = await Deno.readFile(paths.videoPath);
+              await Deno.writeFile(paths.videoItagPath, videoData);
+              await fs.remove(paths.videoPath).catch(() => {});
+            } catch (copyErr) {
+              console.error(`[download] Failed to copy video stream: ${copyErr instanceof Error ? copyErr.message : copyErr}`);
+            }
           }
         }
         if (paths.audioItagPath) {
           try {
-            // Copy audio stream to itag-based path
-            const audioData = await Deno.readFile(paths.audioPath);
-            await Deno.writeFile(paths.audioItagPath, audioData);
+            await Deno.rename(paths.audioPath, paths.audioItagPath);
           } catch (e) {
-            console.warn(`[download] Failed to save audio stream: ${e instanceof Error ? e.message : e}`);
+            console.warn(`[download] Failed to move audio stream: ${e instanceof Error ? e.message : e}`);
+            // Fallback to copy if rename fails (e.g., cross-device)
+            try {
+              const audioData = await Deno.readFile(paths.audioPath);
+              await Deno.writeFile(paths.audioItagPath, audioData);
+              await fs.remove(paths.audioPath).catch(() => {});
+            } catch (copyErr) {
+              console.error(`[download] Failed to copy audio stream: ${copyErr instanceof Error ? copyErr.message : copyErr}`);
+            }
           }
         }
 
-        // Clean up temp files
-        await fs.remove(paths.videoPath).catch(() => {});
-        await fs.remove(paths.audioPath).catch(() => {});
-
-        if (!muxResult.ok) {
-          return {
-            ok: false,
-            error: {
-              type: "mux_failed",
-              message: `Muxing failed: ${muxResult.error.message}`,
-              cause: muxResult.error,
-            },
-          };
-        }
-
-        const stat = await fs.stat(paths.outputPath);
-        finalSize = stat.size;
+        // Calculate total size from streams (no muxed file yet)
+        finalSize = videoResult.size + audioResult.size;
       } else if (streams.combined) {
         // Download combined stream directly (single progress bar, no audio)
         // Speed tracking for combined stream
