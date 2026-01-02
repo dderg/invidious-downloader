@@ -407,6 +407,39 @@ export function createLocalDb(executor: SqliteExecutor) {
     }
   }
 
+  /**
+   * Get total count of downloads (with optional filters).
+   */
+  function getDownloadsCount(options: { userId?: string; channelId?: string } = {}): DbResult<number> {
+    try {
+      const conditions: string[] = [];
+      const params: unknown[] = [];
+
+      if (options.userId !== undefined) {
+        conditions.push("user_id = ?");
+        params.push(options.userId);
+      }
+
+      if (options.channelId !== undefined) {
+        conditions.push("channel_id = ?");
+        params.push(options.channelId);
+      }
+
+      const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+      const row = executor.queryOne<{ count: number }>(
+        `SELECT COUNT(*) as count FROM downloads ${whereClause}`,
+        params,
+      );
+      return okResult(row?.count ?? 0);
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to get downloads count: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
   // ==========================================================================
   // Queue
   // ==========================================================================
@@ -758,6 +791,7 @@ export function createLocalDb(executor: SqliteExecutor) {
     getDownload,
     isDownloaded,
     getDownloads,
+    getDownloadsCount,
     deleteDownload,
     getDownloadStats,
     // Queue

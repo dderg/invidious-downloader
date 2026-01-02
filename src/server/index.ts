@@ -3,6 +3,7 @@
  *
  * Routes:
  * - /api/downloader/* - REST API for downloader
+ * - /ws/dashboard     - WebSocket for real-time dashboard updates
  * - /videoplayback*   - Serve cached videos or proxy
  * - /*                - Proxy all other requests to Invidious
  */
@@ -18,9 +19,11 @@ import type { DownloadManager } from "../services/download-manager.ts";
 import { createProxy, type Proxy, type HttpFetcher } from "./proxy.ts";
 import { createVideoHandler, type VideoHandler, type VideoFileSystem, extractVideoIdFromPath, buildVideoStreamPath, buildAudioStreamPath } from "./video-handler.ts";
 import { createApiRouter } from "./api.ts";
-import { dashboardHtml } from "./dashboard.ts";
+import { generateDashboardHtml } from "./dashboard.ts";
 import { applyInjections, type DownloadStatus } from "./html-injector.ts";
 import { getMediaByteRangesCached, type DASHByteRanges } from "../services/media-parser.ts";
+import { createWebSocketManager, type WebSocketManager } from "./ws-manager.ts";
+import { renderStats, renderQueueList, renderToast } from "./templates.ts";
 
 // ============================================================================
 // API Response Transformation for Cached Videos
@@ -164,6 +167,7 @@ export interface Server {
   app: Hono;
   proxy: Proxy;
   videoHandler: VideoHandler;
+  wsManager: WebSocketManager;
   start(): Promise<void>;
   stop(): void;
 }
@@ -188,6 +192,9 @@ export function createServer(deps: ServerDependencies): Server {
     { videosPath: config.videosPath },
     videoFileSystem,
   );
+
+  // Create WebSocket manager for real-time dashboard updates
+  const wsManager = createWebSocketManager();
 
   // Create Hono app
   const app = new Hono();
@@ -603,7 +610,66 @@ export function createServer(deps: ServerDependencies): Server {
   });
 
   app.get("/downloader/", (c: Context) => {
-    return c.html(dashboardHtml);
+    const html = generateDashboardHtml({ db, downloadManager });
+    return c.html(html);
+  });
+
+  // ==========================================================================
+  // WebSocket for Dashboard Real-time Updates
+  // ==========================================================================
+
+  app.get("/ws/dashboard", (c: Context) => {
+    // Check for WebSocket upgrade
+    const upgradeHeader = c.req.header("upgrade");
+    if (upgradeHeader?.toLowerCase() !== "websocket") {
+      return c.text("Expected WebSocket upgrade", 400);
+    }
+
+    const { socket, response } = Deno.upgradeWebSocket(c.req.raw);
+
+    socket.onopen = () => {
+      wsManager.addClient(socket);
+      
+      // Send initial state
+      const statsResult = db.getDownloadStats();
+      const queueResult = db.getQueue({});
+      const progressArray = downloadManager?.getProgress() ?? [];
+      const progress = new Map(progressArray.map(p => [p.videoId, p]));
+      
+      const stats = {
+        status: "ok" as const,
+        activeDownloads: downloadManager?.getActiveCount() ?? 0,
+        queueLength: queueResult.ok ? queueResult.data.filter(q => q.status === "pending" || q.status === "downloading").length : 0,
+        totalDownloads: statsResult.ok ? statsResult.data.count : 0,
+        totalSizeBytes: statsResult.ok ? statsResult.data.totalBytes : 0,
+      };
+      
+      // Send stats and queue updates
+      try {
+        socket.send(renderStats(stats));
+        if (queueResult.ok) {
+          socket.send(renderQueueList(queueResult.data, progress));
+        }
+      } catch (e) {
+        console.error("[ws] Failed to send initial state:", e);
+      }
+    };
+
+    socket.onclose = () => {
+      wsManager.removeClient(socket);
+    };
+
+    socket.onerror = (e) => {
+      console.error("[ws] WebSocket error:", e);
+      wsManager.removeClient(socket);
+    };
+
+    socket.onmessage = (_e) => {
+      // Client messages are handled by HTMX via REST endpoints
+      // WebSocket is primarily for server -> client pushes
+    };
+
+    return response;
   });
 
   // ==========================================================================
@@ -749,6 +815,7 @@ export function createServer(deps: ServerDependencies): Server {
   }
 
   function stop(): void {
+    wsManager.closeAll();
     if (server) {
       server.shutdown();
       server = null;
@@ -760,6 +827,7 @@ export function createServer(deps: ServerDependencies): Server {
     app,
     proxy,
     videoHandler,
+    wsManager,
     start,
     stop,
   };

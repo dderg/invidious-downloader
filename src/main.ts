@@ -156,7 +156,14 @@ async function main(): Promise<void> {
     server.app.fetch,
   );
   registerCleanup("HTTP Server", () => httpServer.shutdown());
+  registerCleanup("WebSocket Manager", () => server.wsManager.closeAll());
   log.info(`HTTP server listening on port ${config.port}`);
+
+  // 4a. Start WebSocket progress broadcasts
+  server.wsManager.startProgressBroadcasts(() => {
+    const progressArray = downloadManager.getProgress();
+    return new Map(progressArray.map(p => [p.videoId, p]));
+  });
 
   // 5. Start background services
   log.info("Starting background services...");
@@ -169,7 +176,7 @@ async function main(): Promise<void> {
   });
 
   // Start download manager queue processor
-  startQueueProcessor(downloadManager, companionClient, localDb, config);
+  startQueueProcessor(downloadManager, companionClient, localDb, config, server.wsManager);
 
   log.info("Invidious Downloader is ready!");
   log.info(`Access the service at http://localhost:${config.port}`);
@@ -189,6 +196,36 @@ async function main(): Promise<void> {
 type CompanionClientType = ReturnType<typeof createCompanionClient>;
 type DownloadManagerType = ReturnType<typeof createDownloadManager>;
 type LocalDbType = ReturnType<typeof createLocalDb>;
+type WebSocketManagerType = ReturnType<typeof createServer>["wsManager"];
+
+/**
+ * Helper to broadcast dashboard stats via WebSocket.
+ */
+function broadcastDashboardUpdate(
+  wsManager: WebSocketManagerType,
+  localDb: LocalDbType,
+  downloadManager: DownloadManagerType,
+): void {
+  const statsResult = localDb.getDownloadStats();
+  const queueResult = localDb.getQueue({});
+  const progressArray = downloadManager.getProgress();
+  const progress = new Map(progressArray.map(p => [p.videoId, p]));
+  
+  const stats = {
+    status: "ok" as const,
+    activeDownloads: downloadManager.getActiveCount(),
+    queueLength: queueResult.ok 
+      ? queueResult.data.filter(q => q.status === "pending" || q.status === "downloading").length 
+      : 0,
+    totalDownloads: statsResult.ok ? statsResult.data.count : 0,
+    totalSizeBytes: statsResult.ok ? statsResult.data.totalBytes : 0,
+  };
+  
+  wsManager.broadcastStats(stats);
+  if (queueResult.ok) {
+    wsManager.broadcastQueue(queueResult.data, progress);
+  }
+}
 
 /**
  * Start the queue processor that downloads videos from the queue.
@@ -198,6 +235,7 @@ function startQueueProcessor(
   companionClient: CompanionClientType,
   localDb: LocalDbType,
   config: Config,
+  wsManager: WebSocketManagerType,
 ): void {
   const processInterval = 5000; // Check every 5 seconds
   let isProcessing = false;
@@ -217,6 +255,9 @@ function startQueueProcessor(
     try {
       // Mark as downloading
       localDb.updateQueueStatus(queueItem.videoId, "downloading");
+      
+      // Broadcast that download started
+      broadcastDashboardUpdate(wsManager, localDb, downloadManager);
 
       // Get video info from Companion
       const infoResult = await companionClient.getVideoInfo(queueItem.videoId);
@@ -226,6 +267,8 @@ function startQueueProcessor(
           videoId: queueItem.videoId,
           error: infoResult.error.message,
         });
+        broadcastDashboardUpdate(wsManager, localDb, downloadManager);
+        wsManager.broadcastToast(`Failed to get info for ${queueItem.videoId}`, "error");
         return;
       }
 
@@ -236,6 +279,8 @@ function startQueueProcessor(
       if (!streams.video && !streams.audio && !streams.combined) {
         localDb.updateQueueStatus(queueItem.videoId, "failed", "No suitable streams found");
         log.error("No suitable streams", { videoId: queueItem.videoId });
+        broadcastDashboardUpdate(wsManager, localDb, downloadManager);
+        wsManager.broadcastToast(`No suitable streams for "${videoInfo.title}"`, "error");
         return;
       }
 
@@ -296,6 +341,8 @@ function startQueueProcessor(
           videoId: queueItem.videoId,
           error: downloadResult.error.message,
         });
+        broadcastDashboardUpdate(wsManager, localDb, downloadManager);
+        wsManager.broadcastToast(`Download failed: "${videoInfo.title}"`, "error");
         return;
       }
 
@@ -335,6 +382,10 @@ function startQueueProcessor(
         filePath: downloadResult.filePath,
         fileSize: downloadResult.fileSize,
       });
+      
+      // Broadcast completion
+      broadcastDashboardUpdate(wsManager, localDb, downloadManager);
+      wsManager.broadcastDownloadComplete(queueItem.videoId, videoInfo.title);
     } catch (err) {
       localDb.updateQueueStatus(
         queueItem.videoId,
@@ -345,6 +396,8 @@ function startQueueProcessor(
         videoId: queueItem.videoId,
         error: err instanceof Error ? err.message : String(err),
       });
+      broadcastDashboardUpdate(wsManager, localDb, downloadManager);
+      wsManager.broadcastToast(`Error: ${err instanceof Error ? err.message : String(err)}`, "error");
     } finally {
       isProcessing = false;
     }

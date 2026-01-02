@@ -9,6 +9,7 @@
  * - GET  /api/downloader/downloads   - List downloads
  * - GET  /api/downloader/downloads/:id - Get download details
  * - DELETE /api/downloader/downloads/:id - Delete download
+ * - GET  /api/downloader/downloads-html - List downloads as HTML (for HTMX)
  * - GET  /api/downloader/exclusions  - List exclusions
  * - POST /api/downloader/exclusions  - Add exclusion
  * - DELETE /api/downloader/exclusions/:id - Remove exclusion
@@ -18,6 +19,7 @@ import { Hono, type Context } from "@hono/hono";
 import type { LocalDbClient } from "../db/local-db.ts";
 import type { DownloadManager } from "../services/download-manager.ts";
 import type { QueueStatus } from "../db/types.ts";
+import { renderDownloadsList, renderDownloadItem, renderPagination } from "./templates.ts";
 
 // ============================================================================
 // Types
@@ -216,25 +218,41 @@ export function createApiRouter(deps: ApiDependencies) {
     const userId = c.req.query("userId");
     const limitParam = c.req.query("limit");
     const offsetParam = c.req.query("offset");
+    const pageParam = c.req.query("page");
     const orderBy = c.req.query("orderBy") as "downloadedAt" | "title" | "fileSizeBytes" | undefined;
     const orderDir = c.req.query("orderDir") as "asc" | "desc" | undefined;
+
+    const limit = limitParam ? parseInt(limitParam, 10) : 20;
+    const page = pageParam ? parseInt(pageParam, 10) : 1;
+    const offset = offsetParam ? parseInt(offsetParam, 10) : (page - 1) * limit;
 
     const result = db.getDownloads({
       channelId,
       userId,
-      limit: limitParam ? parseInt(limitParam, 10) : undefined,
-      offset: offsetParam ? parseInt(offsetParam, 10) : undefined,
-      orderBy,
-      orderDir,
+      limit,
+      offset,
+      orderBy: orderBy || "downloadedAt",
+      orderDir: orderDir || "desc",
     });
 
     if (!result.ok) {
       return c.json({ error: result.error.message }, 500);
     }
 
+    // Get total count for pagination
+    const countResult = db.getDownloadsCount({ channelId, userId });
+    const total = countResult.ok ? countResult.data : result.data.length;
+
     return c.json({
       items: result.data,
       count: result.data.length,
+      total,
+      pagination: {
+        page,
+        limit,
+        total,
+        hasMore: offset + result.data.length < total,
+      },
     });
   });
 
@@ -440,6 +458,50 @@ export function createApiRouter(deps: ApiDependencies) {
       items: progress,
       count: progress.length,
     });
+  });
+
+  // ==========================================================================
+  // Downloads HTML (for HTMX pagination)
+  // ==========================================================================
+
+  api.get("/downloads-html", async (c: Context) => {
+    const limitParam = c.req.query("limit");
+    const pageParam = c.req.query("page");
+
+    const limit = limitParam ? parseInt(limitParam, 10) : 20;
+    const page = pageParam ? parseInt(pageParam, 10) : 1;
+    const offset = (page - 1) * limit;
+
+    const result = db.getDownloads({
+      limit,
+      offset,
+      orderBy: "downloadedAt",
+      orderDir: "desc",
+    });
+
+    if (!result.ok) {
+      return c.html(`<li class="empty-state">Error loading downloads</li>`);
+    }
+
+    // Get total count for pagination
+    const countResult = db.getDownloadsCount({});
+    const total = countResult.ok ? countResult.data : result.data.length;
+
+    const pagination = { page, limit, total };
+
+    // Return just the list items and pagination for HTMX swap
+    const itemsHtml = result.data.length === 0
+      ? `<li class="empty-state">No downloaded videos yet</li>`
+      : result.data.map(item => renderDownloadItem(item)).join("");
+
+    const paginationHtml = renderPagination(pagination);
+
+    // Include OOB swaps for pagination and count
+    return c.html(`
+      ${itemsHtml}
+      <div id="downloads-pagination" hx-swap-oob="true">${paginationHtml}</div>
+      <span id="downloads-count" hx-swap-oob="innerHTML">${total} videos</span>
+    `);
   });
 
   return api;
