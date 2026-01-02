@@ -71,6 +71,20 @@ export interface DownloadMetadata {
   audioItag?: number;
   width?: number;
   height?: number;
+  /** Video stream mimeType (e.g., "video/mp4; codecs=\"avc1.640028\"") */
+  videoMimeType?: string;
+  /** Audio stream mimeType (e.g., "audio/webm; codecs=\"opus\"") */
+  audioMimeType?: string;
+  /** Video bitrate in bits per second */
+  videoBitrate?: number;
+  /** Audio bitrate in bits per second */
+  audioBitrate?: number;
+  /** Video stream content length in bytes */
+  videoContentLength?: number;
+  /** Audio stream content length in bytes */
+  audioContentLength?: number;
+  /** Audio file extension (e.g., "m4a", "webm") */
+  audioExtension?: string;
 }
 
 /**

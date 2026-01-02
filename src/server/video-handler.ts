@@ -196,9 +196,12 @@ export function buildVideoStreamPath(videosPath: string, videoId: string, itag: 
 
 /**
  * Build the file path for a cached audio stream by itag.
+ * Supports both .m4a (AAC) and .webm (Opus) extensions.
  */
-export function buildAudioStreamPath(videosPath: string, videoId: string, itag: number): string {
-  return `${videosPath}/${videoId}_audio_${itag}.m4a`;
+export function buildAudioStreamPath(videosPath: string, videoId: string, itag: number, extension?: string): string {
+  // If extension is provided, use it; otherwise default to .m4a
+  const ext = extension || "m4a";
+  return `${videosPath}/${videoId}_audio_${itag}.${ext}`;
 }
 
 /**
@@ -412,10 +415,16 @@ export function createVideoHandler(
 
   /**
    * Check if an audio stream by itag is cached.
+   * Checks both .m4a and .webm extensions.
    */
   async function hasAudioStream(videoId: string, itag: number): Promise<boolean> {
-    const streamPath = buildAudioStreamPath(videosPath, videoId, itag);
-    return await fs.exists(streamPath);
+    // Try .m4a first (AAC)
+    const m4aPath = buildAudioStreamPath(videosPath, videoId, itag, "m4a");
+    if (await fs.exists(m4aPath)) return true;
+    
+    // Try .webm (Opus)
+    const webmPath = buildAudioStreamPath(videosPath, videoId, itag, "webm");
+    return await fs.exists(webmPath);
   }
 
   /**
@@ -489,25 +498,33 @@ export function createVideoHandler(
 
   /**
    * Serve a cached audio stream by itag.
+   * Automatically detects the actual file extension (.m4a or .webm).
    */
   async function serveAudioStream(
     videoId: string,
     itag: number,
     rangeHeader: string | null,
   ): Promise<VideoServeResult> {
-    const streamPath = buildAudioStreamPath(videosPath, videoId, itag);
-
+    // Try to find the audio file with either extension
+    let streamPath = buildAudioStreamPath(videosPath, videoId, itag, "m4a");
+    let mimeType = "audio/mp4";
+    
     if (!(await fs.exists(streamPath))) {
-      return {
-        ok: false,
-        error: { type: "not_found", message: `Audio stream ${videoId} itag ${itag} not found in cache` },
-      };
+      // Try .webm
+      streamPath = buildAudioStreamPath(videosPath, videoId, itag, "webm");
+      mimeType = "audio/webm";
+      
+      if (!(await fs.exists(streamPath))) {
+        return {
+          ok: false,
+          error: { type: "not_found", message: `Audio stream ${videoId} itag ${itag} not found in cache` },
+        };
+      }
     }
 
     try {
       const stat = await fs.stat(streamPath);
       const fileSize = stat.size;
-      const mimeType = "audio/mp4";
 
       const headers = new Headers({
         "Content-Type": mimeType,
@@ -558,11 +575,17 @@ export function createVideoHandler(
 
   /**
    * Find all cached streams for a video.
-   * Returns itags of available video and audio streams.
+   * Returns itags of available video and audio streams with their extensions.
    */
-  async function getCachedStreams(videoId: string): Promise<{ videoItags: number[]; audioItags: number[] }> {
+  async function getCachedStreams(videoId: string): Promise<{ 
+    videoItags: number[]; 
+    audioItags: number[];
+    /** Map of audio itag -> extension (e.g., "m4a" or "webm") */
+    audioExtensions: Record<number, string>;
+  }> {
     const videoItags: number[] = [];
     const audioItags: number[] = [];
+    const audioExtensions: Record<number, string> = {};
 
     try {
       // List all files in videos directory
@@ -575,17 +598,20 @@ export function createVideoHandler(
           videoItags.push(parseInt(videoMatch[1], 10));
         }
 
-        // Check for audio streams: {videoId}_audio_{itag}.m4a
-        const audioMatch = entry.name.match(new RegExp(`^${videoId}_audio_(\\d+)\\.m4a$`));
+        // Check for audio streams: {videoId}_audio_{itag}.m4a or .webm
+        const audioMatch = entry.name.match(new RegExp(`^${videoId}_audio_(\\d+)\\.(m4a|webm)$`));
         if (audioMatch) {
-          audioItags.push(parseInt(audioMatch[1], 10));
+          const itag = parseInt(audioMatch[1], 10);
+          const ext = audioMatch[2];
+          audioItags.push(itag);
+          audioExtensions[itag] = ext;
         }
       }
     } catch {
       // Directory doesn't exist or can't be read
     }
 
-    return { videoItags, audioItags };
+    return { videoItags, audioItags, audioExtensions };
   }
 
   return {

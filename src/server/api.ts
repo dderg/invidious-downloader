@@ -276,9 +276,16 @@ export function createApiRouter(deps: ApiDependencies) {
       return c.json({ error: deleteResult.error.message }, 500);
     }
 
+    // Also remove from queue so video can be re-downloaded
+    db.removeFromQueue(videoId);
+
     // Delete actual files
     const deletedFiles: string[] = [];
     
+    // Get the directory from the filePath
+    const videosDir = filePath.substring(0, filePath.lastIndexOf("/"));
+    
+    // Delete the main muxed file
     try {
       await Deno.remove(filePath);
       deletedFiles.push(filePath);
@@ -286,6 +293,7 @@ export function createApiRouter(deps: ApiDependencies) {
       // Ignore if file doesn't exist
     }
 
+    // Delete thumbnail
     if (thumbnailPath) {
       try {
         await Deno.remove(thumbnailPath);
@@ -293,6 +301,32 @@ export function createApiRouter(deps: ApiDependencies) {
       } catch {
         // Ignore if file doesn't exist
       }
+    }
+
+    // Delete all related files (streams, metadata)
+    // Pattern: {videoId}_video_*.mp4, {videoId}_audio_*.m4a, {videoId}_audio_*.webm, {videoId}.json
+    try {
+      for await (const entry of Deno.readDir(videosDir)) {
+        if (!entry.isFile) continue;
+        
+        const name = entry.name;
+        // Match: videoId_video_*, videoId_audio_*, videoId.json
+        if (
+          name.startsWith(`${videoId}_video_`) ||
+          name.startsWith(`${videoId}_audio_`) ||
+          name === `${videoId}.json`
+        ) {
+          const fullPath = `${videosDir}/${name}`;
+          try {
+            await Deno.remove(fullPath);
+            deletedFiles.push(fullPath);
+          } catch {
+            // Ignore errors for individual files
+          }
+        }
+      }
+    } catch {
+      // Ignore errors when reading directory
     }
 
     return c.json({

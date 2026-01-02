@@ -16,10 +16,11 @@ import type { LocalDbClient } from "../db/local-db.ts";
 import type { DownloadManager } from "../services/download-manager.ts";
 
 import { createProxy, type Proxy, type HttpFetcher } from "./proxy.ts";
-import { createVideoHandler, type VideoHandler, type VideoFileSystem, extractVideoIdFromPath } from "./video-handler.ts";
+import { createVideoHandler, type VideoHandler, type VideoFileSystem, extractVideoIdFromPath, buildVideoStreamPath, buildAudioStreamPath } from "./video-handler.ts";
 import { createApiRouter } from "./api.ts";
 import { dashboardHtml } from "./dashboard.ts";
 import { applyInjections, type DownloadStatus } from "./html-injector.ts";
+import { getMediaByteRangesCached, type DASHByteRanges } from "../services/media-parser.ts";
 
 // ============================================================================
 // API Response Transformation for Cached Videos
@@ -28,7 +29,7 @@ import { applyInjections, type DownloadStatus } from "./html-injector.ts";
 /**
  * Transform video API response to serve from cache.
  * For videos with cached DASH streams, modify adaptiveFormats to point to local URLs.
- * Videos without DASH streams will use original formatStreams from the API response.
+ * Uses stored metadata from database to build proper format info.
  */
 // deno-lint-ignore no-explicit-any
 async function transformVideoApiResponse(
@@ -36,45 +37,100 @@ async function transformVideoApiResponse(
   videoId: string,
   videoHandler: VideoHandler,
   baseUrl: string,
+  db: LocalDbClient,
 ): Promise<any> {
   // Check for cached DASH streams
   const cachedStreams = await videoHandler.getCachedStreams(videoId);
   const hasAdaptiveStreams = cachedStreams.videoItags.length > 0 && cachedStreams.audioItags.length > 0;
 
-  if (hasAdaptiveStreams) {
-    console.log(`[api] Video ${videoId} has cached DASH streams: video=${cachedStreams.videoItags}, audio=${cachedStreams.audioItags}`);
-
-    // Filter adaptiveFormats to only include streams we have cached
-    // and rewrite their URLs to point to our local server
-    const cachedAdaptiveFormats = data.adaptiveFormats?.filter((format: any) => {
-      const itag = format.itag;
-      return cachedStreams.videoItags.includes(itag) || cachedStreams.audioItags.includes(itag);
-    }).map((format: any) => {
-      // Rewrite URL to point to our local videoplayback endpoint
-      const localUrl = `${baseUrl}/videoplayback?v=${videoId}&itag=${format.itag}`;
-      return {
-        ...format,
-        url: localUrl,
-      };
-    }) ?? [];
-
-    if (cachedAdaptiveFormats.length > 0) {
-      data.adaptiveFormats = cachedAdaptiveFormats;
-      // Keep DASH URL - Yattee/mpv will generate manifest from adaptiveFormats
-      // Clear the dashUrl since we're providing raw streams, not a manifest
-      data.dashUrl = "";
-      console.log(`[api] Serving ${cachedAdaptiveFormats.length} cached adaptive formats for ${videoId}`);
-    } else {
-      // No matching formats, fall back to progressive
-      data.adaptiveFormats = [];
-      data.dashUrl = "";
-    }
-  } else {
+  if (!hasAdaptiveStreams) {
     // No DASH streams cached, disable adaptive streaming
     // The player should fall back to formatStreams from the original response
     data.adaptiveFormats = [];
     data.dashUrl = "";
     console.log(`[api] Video ${videoId} has no cached DASH streams, player will use original formatStreams`);
+    return data;
+  }
+
+  console.log(`[api] Video ${videoId} has cached DASH streams: video=${cachedStreams.videoItags}, audio=${cachedStreams.audioItags}`);
+
+  // Get download metadata from database
+  const downloadResult = db.getDownload(videoId);
+  const downloadMeta = downloadResult.ok && downloadResult.data ? downloadResult.data.metadata : null;
+
+  // Build adaptiveFormats from cached streams
+  // We prefer using original API data when available, with fallback to stored metadata
+  const cachedAdaptiveFormats: any[] = [];
+
+  // Process video streams
+  for (const videoItag of cachedStreams.videoItags) {
+    // Try to find matching format from original API response
+    const originalFormat = data.adaptiveFormats?.find((f: any) => f.itag === videoItag);
+    
+    if (originalFormat) {
+      // Use original format info with local URL
+      cachedAdaptiveFormats.push({
+        ...originalFormat,
+        url: `${baseUrl}/videoplayback?v=${videoId}&itag=${videoItag}`,
+      });
+    } else if (downloadMeta?.videoItag === videoItag) {
+      // Fallback: build from stored metadata
+      cachedAdaptiveFormats.push({
+        itag: videoItag,
+        url: `${baseUrl}/videoplayback?v=${videoId}&itag=${videoItag}`,
+        mimeType: downloadMeta.videoMimeType || "video/mp4",
+        bitrate: downloadMeta.videoBitrate || 5000000,
+        width: downloadMeta.width || 1920,
+        height: downloadMeta.height || 1080,
+        contentLength: downloadMeta.videoContentLength?.toString(),
+      });
+    }
+  }
+
+  // Process audio streams
+  for (const audioItag of cachedStreams.audioItags) {
+    // Try to find matching format from original API response
+    const originalFormat = data.adaptiveFormats?.find((f: any) => f.itag === audioItag);
+    
+    if (originalFormat) {
+      // Use original format info with local URL
+      cachedAdaptiveFormats.push({
+        ...originalFormat,
+        url: `${baseUrl}/videoplayback?v=${videoId}&itag=${audioItag}`,
+      });
+    } else if (downloadMeta?.audioItag === audioItag) {
+      // Fallback: build from stored metadata
+      // Determine correct mimeType based on actual cached file extension
+      const audioExt = cachedStreams.audioExtensions[audioItag];
+      let audioMimeType = downloadMeta.audioMimeType || "audio/mp4";
+      
+      // Override mimeType based on actual file extension (more reliable for old downloads)
+      if (audioExt === "webm") {
+        audioMimeType = 'audio/webm; codecs="opus"';
+      } else if (audioExt === "m4a" && !audioMimeType.includes("mp4")) {
+        audioMimeType = 'audio/mp4; codecs="mp4a.40.2"';
+      }
+      
+      cachedAdaptiveFormats.push({
+        itag: audioItag,
+        url: `${baseUrl}/videoplayback?v=${videoId}&itag=${audioItag}`,
+        mimeType: audioMimeType,
+        bitrate: downloadMeta.audioBitrate || 128000,
+        contentLength: downloadMeta.audioContentLength?.toString(),
+      });
+    }
+  }
+
+  if (cachedAdaptiveFormats.length > 0) {
+    data.adaptiveFormats = cachedAdaptiveFormats;
+    // Clear the dashUrl since we're providing raw streams, not a manifest
+    data.dashUrl = "";
+    console.log(`[api] Serving ${cachedAdaptiveFormats.length} cached adaptive formats for ${videoId}`);
+  } else {
+    // No matching formats found, fall back to progressive
+    data.adaptiveFormats = [];
+    data.dashUrl = "";
+    console.log(`[api] Could not build adaptiveFormats for ${videoId}, player will use original formatStreams`);
   }
 
   // Don't modify formatStreams - keep original response.
@@ -271,7 +327,7 @@ export function createServer(deps: ServerDependencies): Server {
     const baseUrl = `${protocol}://${host}`;
 
     // Modify response for cached playback
-    const modifiedData = await transformVideoApiResponse(data, videoId, videoHandler, baseUrl);
+    const modifiedData = await transformVideoApiResponse(data, videoId, videoHandler, baseUrl, db);
 
     return c.json(modifiedData);
   });
@@ -336,41 +392,89 @@ export function createServer(deps: ServerDependencies): Server {
     const host = c.req.header("host") || "localhost:3001";
     const baseUrl = `${protocol}://${host}`;
 
-    // Get video metadata for duration
-    const metadata = await videoHandler.getMetadata(videoId);
-    const duration = (typeof metadata?.duration === 'number' ? metadata.duration : 0) as number;
+    // Get download metadata from database for duration and codec info
+    const downloadResult = db.getDownload(videoId);
+    const downloadMeta = downloadResult.ok && downloadResult.data ? downloadResult.data : null;
+    
+    // Get duration from download record
+    const duration = downloadMeta?.durationSeconds || 0;
     const durationISO = `PT${Math.floor(duration / 60)}M${(duration % 60).toFixed(3)}S`;
 
-    // Generate DASH manifest XML
-    // We use a simple manifest with the cached video and audio streams
+    // Get metadata for dimensions and codec info
+    const metadata = downloadMeta?.metadata;
     const videoItag = cachedStreams.videoItags[0]; // Use first available video itag
     const audioItag = cachedStreams.audioItags[0]; // Use first available audio itag
-    const width = (typeof metadata?.width === 'number' ? metadata.width : 1920) as number;
-    const height = (typeof metadata?.height === 'number' ? metadata.height : 1080) as number;
+    const width = metadata?.width || 1920;
+    const height = metadata?.height || 1080;
+    
+    // Determine audio mime type and codec from cached file extension
+    const audioExt = cachedStreams.audioExtensions[audioItag] || "m4a";
+    let audioMimeType = "audio/mp4";
+    let audioCodec = "mp4a.40.2"; // AAC
+    
+    if (audioExt === "webm") {
+      audioMimeType = "audio/webm";
+      audioCodec = "opus";
+    }
+    
+    // Get video codec from stored mimeType or default
+    let videoCodec = "avc1.640028"; // H.264 High Profile
+    if (metadata?.videoMimeType) {
+      const codecMatch = metadata.videoMimeType.match(/codecs="([^"]+)"/);
+      if (codecMatch) {
+        videoCodec = codecMatch[1];
+      }
+    }
 
+    // Parse byte ranges from the actual media files
+    const videoStreamPath = buildVideoStreamPath(videoHandler.videosPath, videoId, videoItag);
+    const audioStreamPath = buildAudioStreamPath(videoHandler.videosPath, videoId, audioItag, audioExt);
+
+    const videoRangesResult = await getMediaByteRangesCached(videoStreamPath);
+    const audioRangesResult = await getMediaByteRangesCached(audioStreamPath);
+
+    // Default ranges if parsing fails
+    let videoRanges: DASHByteRanges = { initRange: "0-0", indexRange: "0-0" };
+    let audioRanges: DASHByteRanges = { initRange: "0-0", indexRange: "0-0" };
+
+    if (videoRangesResult.ok) {
+      videoRanges = videoRangesResult.ranges;
+      console.log(`[dash-manifest] Video ${videoId} video stream ranges: init=${videoRanges.initRange}, index=${videoRanges.indexRange}`);
+    } else {
+      console.error(`[dash-manifest] Failed to parse video stream ${videoStreamPath}: ${videoRangesResult.error}`);
+    }
+
+    if (audioRangesResult.ok) {
+      audioRanges = audioRangesResult.ranges;
+      console.log(`[dash-manifest] Video ${videoId} audio stream ranges: init=${audioRanges.initRange}, index=${audioRanges.indexRange}`);
+    } else {
+      console.error(`[dash-manifest] Failed to parse audio stream ${audioStreamPath}: ${audioRangesResult.error}`);
+    }
+
+    // Generate DASH manifest XML with real byte ranges
     const manifest = `<?xml version="1.0" encoding="UTF-8"?>
 <MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="${durationISO}" minBufferTime="PT1.5S">
   <Period duration="${durationISO}">
     <AdaptationSet mimeType="video/mp4" contentType="video" subsegmentAlignment="true" subsegmentStartsWithSAP="1">
-      <Representation id="${videoItag}" bandwidth="5000000" codecs="avc1.640028" width="${width}" height="${height}">
+      <Representation id="${videoItag}" bandwidth="${metadata?.videoBitrate || 5000000}" codecs="${videoCodec}" width="${width}" height="${height}">
         <BaseURL>${baseUrl}/videoplayback?v=${videoId}&amp;itag=${videoItag}</BaseURL>
-        <SegmentBase indexRange="0-0">
-          <Initialization range="0-0"/>
+        <SegmentBase indexRange="${videoRanges.indexRange}">
+          <Initialization range="${videoRanges.initRange}"/>
         </SegmentBase>
       </Representation>
     </AdaptationSet>
-    <AdaptationSet mimeType="audio/mp4" contentType="audio" subsegmentAlignment="true" subsegmentStartsWithSAP="1">
-      <Representation id="${audioItag}" bandwidth="128000" codecs="mp4a.40.2" audioSamplingRate="44100">
+    <AdaptationSet mimeType="${audioMimeType}" contentType="audio" subsegmentAlignment="true" subsegmentStartsWithSAP="1">
+      <Representation id="${audioItag}" bandwidth="${metadata?.audioBitrate || 128000}" codecs="${audioCodec}" audioSamplingRate="48000">
         <BaseURL>${baseUrl}/videoplayback?v=${videoId}&amp;itag=${audioItag}</BaseURL>
-        <SegmentBase indexRange="0-0">
-          <Initialization range="0-0"/>
+        <SegmentBase indexRange="${audioRanges.indexRange}">
+          <Initialization range="${audioRanges.initRange}"/>
         </SegmentBase>
       </Representation>
     </AdaptationSet>
   </Period>
 </MPD>`;
 
-    console.log(`[dash-manifest] Generated manifest for ${videoId}: video itag ${videoItag}, audio itag ${audioItag}`);
+    console.log(`[dash-manifest] Generated manifest for ${videoId}: video itag ${videoItag} (${videoCodec}), audio itag ${audioItag} (${audioCodec})`);
 
     return new Response(manifest, {
       headers: {

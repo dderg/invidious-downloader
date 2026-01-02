@@ -278,25 +278,36 @@ describe("selectBestVideoStream", () => {
 });
 
 describe("selectBestAudioStream", () => {
-  it("should select highest bitrate audio", () => {
+  it("should select highest bitrate audio within same container", () => {
     const streams = [
-      createMockAudioStream({ bitrate: 128000 }),
-      createMockAudioStream({ bitrate: 160000 }),
-      createMockAudioStream({ bitrate: 64000 }),
+      createMockAudioStream({ bitrate: 128000, mimeType: "audio/mp4; codecs=\"mp4a.40.2\"" }),
+      createMockAudioStream({ bitrate: 160000, mimeType: "audio/mp4; codecs=\"mp4a.40.2\"" }),
+      createMockAudioStream({ bitrate: 64000, mimeType: "audio/mp4; codecs=\"mp4a.40.2\"" }),
     ];
 
     const result = selectBestAudioStream(streams);
     assertEquals(result?.bitrate, 160000);
   });
 
-  it("should prefer opus over mp4a at same bitrate", () => {
+  it("should prefer mp4a over opus for DASH compatibility", () => {
     const streams = [
       createMockAudioStream({ bitrate: 160000, mimeType: "audio/mp4; codecs=\"mp4a.40.2\"" }),
       createMockAudioStream({ bitrate: 160000, mimeType: "audio/webm; codecs=\"opus\"" }),
     ];
 
     const result = selectBestAudioStream(streams);
-    assertEquals(result?.mimeType.includes("opus"), true);
+    assertEquals(result?.mimeType.includes("mp4a"), true);
+  });
+
+  it("should prefer lower bitrate m4a over higher bitrate webm for DASH compatibility", () => {
+    const streams = [
+      createMockAudioStream({ bitrate: 128000, mimeType: "audio/mp4; codecs=\"mp4a.40.2\"" }),
+      createMockAudioStream({ bitrate: 160000, mimeType: "audio/webm; codecs=\"opus\"" }),
+    ];
+
+    const result = selectBestAudioStream(streams);
+    assertEquals(result?.mimeType.includes("mp4"), true);
+    assertEquals(result?.bitrate, 128000);
   });
 
   it("should return null for empty streams", () => {

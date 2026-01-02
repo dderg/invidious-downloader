@@ -313,6 +313,10 @@ export function selectBestVideoStream(
 /**
  * Select best audio stream.
  * Pure function.
+ *
+ * Prefers M4A (AAC) over WebM (Opus) for DASH compatibility.
+ * The DASH isoff-on-demand profile requires ISO Base Media File Format (MP4/M4A),
+ * and WebM's EBML container format is not compatible with SegmentBase indexing.
  */
 export function selectBestAudioStream(
   streams: AdaptiveFormat[],
@@ -324,19 +328,20 @@ export function selectBestAudioStream(
 
   if (audioStreams.length === 0) return null;
 
-  // Sort by bitrate (desc), prefer opus > mp4a
+  // Sort by: 1) container format (m4a > webm for DASH), 2) bitrate (desc)
   return audioStreams.sort((a, b) => {
-    // Bitrate priority
-    const bitrateDiff = b.bitrate - a.bitrate;
-    if (bitrateDiff !== 0) return bitrateDiff;
-
-    // Codec preference (opus > mp4a for quality)
-    const codecPriority = (mime: string) => {
-      if (mime.includes("opus")) return 2;
-      if (mime.includes("mp4a")) return 1;
+    // Prefer MP4/M4A container for DASH compatibility
+    const containerPriority = (mime: string) => {
+      if (mime.startsWith("audio/mp4")) return 2; // M4A - DASH compatible
+      if (mime.startsWith("audio/webm")) return 1; // WebM - not DASH compatible
       return 0;
     };
-    return codecPriority(b.mimeType) - codecPriority(a.mimeType);
+
+    const containerDiff = containerPriority(b.mimeType) - containerPriority(a.mimeType);
+    if (containerDiff !== 0) return containerDiff;
+
+    // Same container: prefer higher bitrate
+    return b.bitrate - a.bitrate;
   })[0];
 }
 

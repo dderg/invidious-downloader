@@ -317,6 +317,13 @@ function startQueueProcessor(
           audioItag: downloadResult.audioItag,
           width: downloadResult.videoWidth,
           height: downloadResult.videoHeight,
+          videoMimeType: downloadResult.videoMimeType,
+          audioMimeType: downloadResult.audioMimeType,
+          videoBitrate: downloadResult.videoBitrate,
+          audioBitrate: downloadResult.audioBitrate,
+          videoContentLength: downloadResult.videoContentLength,
+          audioContentLength: downloadResult.audioContentLength,
+          audioExtension: downloadResult.audioExtension,
         },
         fileSizeBytes: downloadResult.fileSize,
       });

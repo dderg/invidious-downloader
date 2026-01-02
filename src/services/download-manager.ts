@@ -56,7 +56,7 @@ export interface DownloadOptions {
  * Download result.
  */
 export type DownloadResult =
-  | { ok: true; filePath: string; fileSize: number; duration: number; videoItag?: number; audioItag?: number; videoWidth?: number; videoHeight?: number }
+  | { ok: true; filePath: string; fileSize: number; duration: number; videoItag?: number; audioItag?: number; videoWidth?: number; videoHeight?: number; videoMimeType?: string; audioMimeType?: string; videoBitrate?: number; audioBitrate?: number; videoContentLength?: number; audioContentLength?: number; audioExtension?: string }
   | { ok: false; error: DownloadError };
 
 export interface DownloadError {
@@ -362,6 +362,21 @@ export function sanitizeFilename(name: string): string {
 }
 
 /**
+ * Determine audio file extension from mimeType.
+ * WebM/Opus stays as .webm, MP4/AAC stays as .m4a
+ */
+export function getAudioExtension(mimeType?: string): string {
+  if (!mimeType) return "m4a"; // Default to m4a
+  
+  // Check container type from mimeType (e.g., "audio/webm; codecs=\"opus\"")
+  if (mimeType.startsWith("audio/webm")) {
+    return "webm";
+  }
+  // audio/mp4, audio/m4a, etc. -> m4a
+  return "m4a";
+}
+
+/**
  * Generate output paths for a video download.
  * Includes itag-based paths for DASH streaming support.
  */
@@ -372,6 +387,7 @@ export function generatePaths(
   tempDir?: string,
   videoItag?: number,
   audioItag?: number,
+  audioMimeType?: string,
 ): {
   videoPath: string;
   audioPath: string;
@@ -381,9 +397,11 @@ export function generatePaths(
   // Itag-based paths for DASH streaming
   videoItagPath: string | null;
   audioItagPath: string | null;
+  audioExtension: string;
 } {
   const safeName = sanitizeFilename(title);
   const temp = tempDir ?? outputDir;
+  const audioExt = getAudioExtension(audioMimeType);
 
   return {
     videoPath: `${temp}/${videoId}_video.tmp`,
@@ -392,8 +410,10 @@ export function generatePaths(
     thumbnailPath: `${outputDir}/${videoId}.webp`,
     metadataPath: `${outputDir}/${videoId}.json`,
     // Store separate streams with itag for DASH support
+    // Audio extension depends on codec (webm for Opus, m4a for AAC)
     videoItagPath: videoItag ? `${outputDir}/${videoId}_video_${videoItag}.mp4` : null,
-    audioItagPath: audioItag ? `${outputDir}/${videoId}_audio_${audioItag}.m4a` : null,
+    audioItagPath: audioItag ? `${outputDir}/${videoId}_audio_${audioItag}.${audioExt}` : null,
+    audioExtension: audioExt,
   };
 }
 
@@ -434,6 +454,7 @@ export function createDownloadManager(
     // Get itags for separate stream storage
     const videoItag = streams.video?.itag;
     const audioItag = streams.audio?.itag;
+    const audioMimeType = streams.audio?.mimeType;
 
     // Generate paths (including itag-based paths for DASH support)
     const paths = generatePaths(
@@ -443,6 +464,7 @@ export function createDownloadManager(
       config.tempDir,
       videoItag,
       audioItag,
+      audioMimeType,
     );
 
     // Ensure output directory exists
@@ -708,6 +730,13 @@ export function createDownloadManager(
         audioItag: streams.audio?.itag,
         videoWidth: streams.video?.width,
         videoHeight: streams.video?.height,
+        videoMimeType: streams.video?.mimeType,
+        audioMimeType: streams.audio?.mimeType,
+        videoBitrate: streams.video?.bitrate,
+        audioBitrate: streams.audio?.bitrate,
+        videoContentLength: streams.video?.contentLength ? parseInt(streams.video.contentLength, 10) : undefined,
+        audioContentLength: streams.audio?.contentLength ? parseInt(streams.audio.contentLength, 10) : undefined,
+        audioExtension: paths.audioExtension,
       };
     } catch (error) {
       // Clean up any temp files
