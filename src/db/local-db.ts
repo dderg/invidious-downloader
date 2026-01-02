@@ -594,6 +594,23 @@ export function createLocalDb(executor: SqliteExecutor) {
   }
 
   /**
+   * Get a queue item by video ID.
+   */
+  function getQueueItem(videoId: string): DbResult<QueueItem | null> {
+    try {
+      const sql = "SELECT * FROM download_queue WHERE video_id = ?";
+      const row = executor.queryOne<QueueRow>(sql, [videoId]);
+      return okResult(row ? mapQueueRow(row) : null);
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to get queue item: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
    * Clear completed/failed/cancelled items from queue.
    */
   function clearCompletedQueue(): DbResult<number> {
@@ -750,6 +767,7 @@ export function createLocalDb(executor: SqliteExecutor) {
     updateQueueStatus,
     removeFromQueue,
     isInQueue,
+    getQueueItem,
     clearCompletedQueue,
     // Exclusions
     addExclusion,

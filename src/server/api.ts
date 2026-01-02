@@ -156,9 +156,19 @@ export function createApiRouter(deps: ApiDependencies) {
     }
 
     // Check if already in queue
-    const isInQueue = db.isInQueue(body.videoId);
-    if (isInQueue.ok && isInQueue.data) {
-      return c.json({ error: "Video already in queue" }, 409);
+    const queueItem = db.getQueueItem(body.videoId);
+    if (queueItem.ok && queueItem.data) {
+      const status = queueItem.data.status;
+      
+      // If video is actively being processed, reject
+      if (status === "pending" || status === "downloading") {
+        return c.json({ error: "Video already in queue" }, 409);
+      }
+      
+      // If video failed or was cancelled, remove from queue to allow retry
+      if (status === "failed" || status === "cancelled") {
+        db.removeFromQueue(body.videoId);
+      }
     }
 
     // Add to queue
@@ -257,17 +267,37 @@ export function createApiRouter(deps: ApiDependencies) {
       return c.json({ error: "Download not found" }, 404);
     }
 
-    // Delete from database (file deletion should be handled separately)
+    const { filePath, thumbnailPath } = downloadResult.data;
+
+    // Delete from database
     const deleteResult = db.deleteDownload(videoId);
 
     if (!deleteResult.ok) {
       return c.json({ error: deleteResult.error.message }, 500);
     }
 
+    // Delete actual files
+    const deletedFiles: string[] = [];
+    
+    try {
+      await Deno.remove(filePath);
+      deletedFiles.push(filePath);
+    } catch {
+      // Ignore if file doesn't exist
+    }
+
+    if (thumbnailPath) {
+      try {
+        await Deno.remove(thumbnailPath);
+        deletedFiles.push(thumbnailPath);
+      } catch {
+        // Ignore if file doesn't exist
+      }
+    }
+
     return c.json({
       success: true,
-      filePath: downloadResult.data.filePath,
-      message: "Database record deleted. File may need manual deletion.",
+      deletedFiles,
     });
   });
 

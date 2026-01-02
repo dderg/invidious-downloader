@@ -22,11 +22,17 @@ import type { DownloadMetadata } from "../db/types.ts";
  */
 export interface DownloadProgress {
   videoId: string;
-  phase: "downloading_video" | "downloading_audio" | "muxing" | "complete" | "failed";
-  bytesDownloaded: number;
-  totalBytes: number | null;
-  percentage: number | null;
-  speed: number | null; // bytes per second
+  phase: "downloading" | "muxing" | "complete" | "failed";
+  // Video stream progress
+  videoBytesDownloaded: number;
+  videoTotalBytes: number | null;
+  videoPercentage: number | null;
+  videoSpeed: number | null; // bytes per second
+  // Audio stream progress (null if combined stream or no audio)
+  audioBytesDownloaded: number | null;
+  audioTotalBytes: number | null;
+  audioPercentage: number | null;
+  audioSpeed: number | null; // bytes per second
   error?: string;
 }
 
@@ -50,7 +56,7 @@ export interface DownloadOptions {
  * Download result.
  */
 export type DownloadResult =
-  | { ok: true; filePath: string; fileSize: number; duration: number }
+  | { ok: true; filePath: string; fileSize: number; duration: number; videoItag?: number; audioItag?: number; videoWidth?: number; videoHeight?: number }
   | { ok: false; error: DownloadError };
 
 export interface DownloadError {
@@ -88,11 +94,17 @@ interface ActiveDownload {
 export interface ActiveDownloadProgress {
   videoId: string;
   title: string;
-  phase: "downloading_video" | "downloading_audio" | "muxing" | "queued";
-  bytesDownloaded: number;
-  totalBytes: number | null;
-  percentage: number | null;
-  speed: number | null;
+  phase: "downloading" | "muxing" | "queued";
+  // Video stream progress
+  videoBytesDownloaded: number;
+  videoTotalBytes: number | null;
+  videoPercentage: number | null;
+  videoSpeed: number | null; // bytes per second
+  // Audio stream progress (null if combined stream or no audio)
+  audioBytesDownloaded: number | null;
+  audioTotalBytes: number | null;
+  audioPercentage: number | null;
+  audioSpeed: number | null; // bytes per second
   startedAt: number;
 }
 
@@ -154,10 +166,13 @@ export interface HttpDownloader {
 }
 
 /**
- * Default HTTP downloader using fetch.
+ * Default HTTP downloader using fetch with streaming writes to disk.
+ * Writes chunks directly to disk to avoid memory pressure from large files.
  */
 export const defaultHttpDownloader: HttpDownloader = {
   async downloadToFile(url, outputPath, options) {
+    let file: Deno.FsFile | null = null;
+
     try {
       const response = await fetch(url, { signal: options?.signal });
       if (!response.ok) {
@@ -172,7 +187,9 @@ export const defaultHttpDownloader: HttpDownloader = {
         return { ok: false, error: "No response body" };
       }
 
-      const chunks: Uint8Array[] = [];
+      // Open file for streaming writes
+      file = await Deno.open(outputPath, { write: true, create: true, truncate: true });
+
       let downloaded = 0;
       let lastProgressTime = Date.now();
       let lastDownloaded = 0;
@@ -186,7 +203,8 @@ export const defaultHttpDownloader: HttpDownloader = {
         const { done, value } = await reader.read();
         if (done) break;
 
-        chunks.push(value);
+        // Write chunk directly to disk (no memory accumulation)
+        await file.write(value);
         downloaded += value.length;
 
         // Rate limiting
@@ -217,25 +235,116 @@ export const defaultHttpDownloader: HttpDownloader = {
         options.onProgress(downloaded, total);
       }
 
-      // Write to file
-      const totalSize = chunks.reduce((sum, chunk) => sum + chunk.length, 0);
-      const data = new Uint8Array(totalSize);
-      let offset = 0;
-      for (const chunk of chunks) {
-        data.set(chunk, offset);
-        offset += chunk.length;
-      }
-
-      await Deno.writeFile(outputPath, data);
       return { ok: true, size: downloaded };
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
         return { ok: false, error: "Download cancelled" };
       }
       return { ok: false, error: error instanceof Error ? error.message : "Unknown error" };
+    } finally {
+      // Always close the file handle
+      if (file) {
+        try {
+          file.close();
+        } catch {
+          // Ignore close errors
+        }
+      }
     }
   },
 };
+
+/**
+ * Download audio synced to video progress.
+ * Throttles audio download to stay at or slightly behind video percentage.
+ * This ensures both streams finish around the same time.
+ */
+async function downloadAudioSynced(
+  url: string,
+  outputPath: string,
+  audioTotalBytes: number | null,
+  options: {
+    signal?: AbortSignal;
+    getVideoPercentage: () => number; // Returns current video download percentage (0-1)
+    onProgress?: (downloaded: number, total: number | null) => void;
+  },
+): Promise<{ ok: true; size: number } | { ok: false; error: string }> {
+  let file: Deno.FsFile | null = null;
+  const LEAD_BUFFER = 0.02; // Allow audio to lead by up to 2%
+
+  try {
+    const response = await fetch(url, { signal: options.signal });
+    if (!response.ok) {
+      return { ok: false, error: `HTTP ${response.status}: ${response.statusText}` };
+    }
+
+    const contentLength = response.headers.get("content-length");
+    const total = contentLength ? parseInt(contentLength, 10) : audioTotalBytes;
+
+    const reader = response.body?.getReader();
+    if (!reader) {
+      return { ok: false, error: "No response body" };
+    }
+
+    file = await Deno.open(outputPath, { write: true, create: true, truncate: true });
+    let downloaded = 0;
+    let lastProgressTime = Date.now();
+
+    while (true) {
+      // Check if we need to throttle (audio ahead of video)
+      if (total && total > 0) {
+        const audioPercentage = downloaded / total;
+        let videoPercentage = options.getVideoPercentage();
+
+        // If audio is ahead of video + buffer, wait for video to catch up
+        while (audioPercentage > videoPercentage + LEAD_BUFFER && videoPercentage < 1) {
+          if (options.signal?.aborted) {
+            return { ok: false, error: "Download cancelled" };
+          }
+          await new Promise((resolve) => setTimeout(resolve, 100));
+          videoPercentage = options.getVideoPercentage();
+        }
+      }
+
+      if (options.signal?.aborted) {
+        return { ok: false, error: "Download cancelled" };
+      }
+
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      await file.write(value);
+      downloaded += value.length;
+
+      // Progress callback (throttled to every 100ms)
+      const now = Date.now();
+      if (options.onProgress && now - lastProgressTime > 100) {
+        options.onProgress(downloaded, total);
+        lastProgressTime = now;
+      }
+    }
+
+    // Final progress
+    if (options.onProgress) {
+      options.onProgress(downloaded, total);
+    }
+
+    return { ok: true, size: downloaded };
+  } catch (error) {
+    if (error instanceof Error && error.name === "AbortError") {
+      return { ok: false, error: "Download cancelled" };
+    }
+    return { ok: false, error: error instanceof Error ? error.message : "Unknown error" };
+  } finally {
+    if (file) {
+      try {
+        file.close();
+      } catch {
+        // Ignore close errors
+      }
+    }
+  }
+}
 
 // ============================================================================
 // Path Utilities (pure functions)
@@ -254,18 +363,24 @@ export function sanitizeFilename(name: string): string {
 
 /**
  * Generate output paths for a video download.
+ * Includes itag-based paths for DASH streaming support.
  */
 export function generatePaths(
   videoId: string,
   title: string,
   outputDir: string,
   tempDir?: string,
+  videoItag?: number,
+  audioItag?: number,
 ): {
   videoPath: string;
   audioPath: string;
   outputPath: string;
   thumbnailPath: string;
   metadataPath: string;
+  // Itag-based paths for DASH streaming
+  videoItagPath: string | null;
+  audioItagPath: string | null;
 } {
   const safeName = sanitizeFilename(title);
   const temp = tempDir ?? outputDir;
@@ -276,6 +391,9 @@ export function generatePaths(
     outputPath: `${outputDir}/${videoId}.mp4`,
     thumbnailPath: `${outputDir}/${videoId}.webp`,
     metadataPath: `${outputDir}/${videoId}.json`,
+    // Store separate streams with itag for DASH support
+    videoItagPath: videoItag ? `${outputDir}/${videoId}_video_${videoItag}.mp4` : null,
+    audioItagPath: audioItag ? `${outputDir}/${videoId}_audio_${audioItag}.m4a` : null,
   };
 }
 
@@ -313,8 +431,19 @@ export function createDownloadManager(
       };
     }
 
-    // Generate paths
-    const paths = generatePaths(videoInfo.videoId, videoInfo.title, outputDir, config.tempDir);
+    // Get itags for separate stream storage
+    const videoItag = streams.video?.itag;
+    const audioItag = streams.audio?.itag;
+
+    // Generate paths (including itag-based paths for DASH support)
+    const paths = generatePaths(
+      videoInfo.videoId,
+      videoInfo.title,
+      outputDir,
+      config.tempDir,
+      videoItag,
+      audioItag,
+    );
 
     // Ensure output directory exists
     try {
@@ -341,77 +470,92 @@ export function createDownloadManager(
 
       // Strategy: prefer separate video + audio (better quality), fall back to combined
       if (streams.video && streams.audio) {
-        // Download video stream
-        onProgress({
-          videoId: videoInfo.videoId,
-          phase: "downloading_video",
-          bytesDownloaded: 0,
-          totalBytes: streams.video.contentLength ? parseInt(streams.video.contentLength, 10) : null,
-          percentage: 0,
-          speed: null,
-        });
+        // Shared progress state for parallel downloads
+        let videoDownloaded = 0;
+        let videoTotal: number | null = streams.video.contentLength
+          ? parseInt(streams.video.contentLength, 10)
+          : null;
+        let audioDownloaded = 0;
+        let audioTotal: number | null = streams.audio.contentLength
+          ? parseInt(streams.audio.contentLength, 10)
+          : null;
 
-        const videoResult = await downloader.downloadToFile(
-          streams.video.url,
-          paths.videoPath,
-          {
+        // Speed tracking
+        const startTime = Date.now();
+        let lastVideoDownloaded = 0;
+        let lastAudioDownloaded = 0;
+        let lastSpeedTime = startTime;
+        let videoSpeed: number | null = null;
+        let audioSpeed: number | null = null;
+
+        // Get current video download percentage (0-1)
+        const getVideoPercentage = () => (videoTotal ? videoDownloaded / videoTotal : 0);
+
+        // Report combined progress for both streams
+        const reportProgress = () => {
+          // Calculate speeds (bytes per second over last interval)
+          const now = Date.now();
+          const elapsed = (now - lastSpeedTime) / 1000;
+          if (elapsed >= 0.5) {
+            // Update speed every 500ms
+            videoSpeed = (videoDownloaded - lastVideoDownloaded) / elapsed;
+            audioSpeed = (audioDownloaded - lastAudioDownloaded) / elapsed;
+            lastVideoDownloaded = videoDownloaded;
+            lastAudioDownloaded = audioDownloaded;
+            lastSpeedTime = now;
+          }
+
+          onProgress({
+            videoId: videoInfo.videoId,
+            phase: "downloading",
+            videoBytesDownloaded: videoDownloaded,
+            videoTotalBytes: videoTotal,
+            videoPercentage: videoTotal ? Math.round((videoDownloaded / videoTotal) * 100) : null,
+            videoSpeed,
+            audioBytesDownloaded: audioDownloaded,
+            audioTotalBytes: audioTotal,
+            audioPercentage: audioTotal ? Math.round((audioDownloaded / audioTotal) * 100) : null,
+            audioSpeed,
+          });
+        };
+
+        // Initial progress
+        reportProgress();
+
+        // Download both streams in parallel
+        const [videoResult, audioResult] = await Promise.all([
+          // Video: uses configured rate limit
+          downloader.downloadToFile(streams.video.url, paths.videoPath, {
             signal: abortController.signal,
             rateLimit,
             onProgress: (downloaded, total) => {
-              onProgress({
-                videoId: videoInfo.videoId,
-                phase: "downloading_video",
-                bytesDownloaded: downloaded,
-                totalBytes: total,
-                percentage: total ? Math.round((downloaded / total) * 100) : null,
-                speed: null,
-              });
+              videoDownloaded = downloaded;
+              if (total) videoTotal = total;
+              reportProgress();
             },
-          },
-        );
-
-        if (!videoResult.ok) {
-          return {
-            ok: false,
-            error: { type: "download_failed", message: `Video download failed: ${videoResult.error}` },
-          };
-        }
-
-        // Download audio stream
-        onProgress({
-          videoId: videoInfo.videoId,
-          phase: "downloading_audio",
-          bytesDownloaded: 0,
-          totalBytes: streams.audio.contentLength ? parseInt(streams.audio.contentLength, 10) : null,
-          percentage: 0,
-          speed: null,
-        });
-
-        const audioResult = await downloader.downloadToFile(
-          streams.audio.url,
-          paths.audioPath,
-          {
+          }),
+          // Audio: synced to video progress (stays slightly behind or equal)
+          downloadAudioSynced(streams.audio.url, paths.audioPath, audioTotal, {
             signal: abortController.signal,
-            rateLimit,
+            getVideoPercentage,
             onProgress: (downloaded, total) => {
-              onProgress({
-                videoId: videoInfo.videoId,
-                phase: "downloading_audio",
-                bytesDownloaded: downloaded,
-                totalBytes: total,
-                percentage: total ? Math.round((downloaded / total) * 100) : null,
-                speed: null,
-              });
+              audioDownloaded = downloaded;
+              if (total) audioTotal = total;
+              reportProgress();
             },
-          },
-        );
+          }),
+        ]);
 
-        if (!audioResult.ok) {
-          // Clean up video file
+        // Handle errors - if either failed, clean up both
+        if (!videoResult.ok || !audioResult.ok) {
           await fs.remove(paths.videoPath).catch(() => {});
+          await fs.remove(paths.audioPath).catch(() => {});
+          const errorMsg = !videoResult.ok
+            ? `Video download failed: ${(videoResult as { ok: false; error: string }).error}`
+            : `Audio download failed: ${(audioResult as { ok: false; error: string }).error}`;
           return {
             ok: false,
-            error: { type: "download_failed", message: `Audio download failed: ${audioResult.error}` },
+            error: { type: "download_failed", message: errorMsg },
           };
         }
 
@@ -419,10 +563,14 @@ export function createDownloadManager(
         onProgress({
           videoId: videoInfo.videoId,
           phase: "muxing",
-          bytesDownloaded: videoResult.size + audioResult.size,
-          totalBytes: null,
-          percentage: null,
-          speed: null,
+          videoBytesDownloaded: videoResult.size,
+          videoTotalBytes: videoResult.size,
+          videoPercentage: 100,
+          videoSpeed: null,
+          audioBytesDownloaded: audioResult.size,
+          audioTotalBytes: audioResult.size,
+          audioPercentage: 100,
+          audioSpeed: null,
         });
 
         const muxResult = await muxer.mux({
@@ -430,6 +578,26 @@ export function createDownloadManager(
           audioPath: paths.audioPath,
           outputPath: paths.outputPath,
         });
+
+        // Before cleaning up temp files, copy them to itag-based paths for DASH streaming
+        if (paths.videoItagPath) {
+          try {
+            // Copy video stream to itag-based path
+            const videoData = await Deno.readFile(paths.videoPath);
+            await Deno.writeFile(paths.videoItagPath, videoData);
+          } catch (e) {
+            console.warn(`[download] Failed to save video stream: ${e instanceof Error ? e.message : e}`);
+          }
+        }
+        if (paths.audioItagPath) {
+          try {
+            // Copy audio stream to itag-based path
+            const audioData = await Deno.readFile(paths.audioPath);
+            await Deno.writeFile(paths.audioItagPath, audioData);
+          } catch (e) {
+            console.warn(`[download] Failed to save audio stream: ${e instanceof Error ? e.message : e}`);
+          }
+        }
 
         // Clean up temp files
         await fs.remove(paths.videoPath).catch(() => {});
@@ -449,16 +617,25 @@ export function createDownloadManager(
         const stat = await fs.stat(paths.outputPath);
         finalSize = stat.size;
       } else if (streams.combined) {
-        // Download combined stream directly
+        // Download combined stream directly (single progress bar, no audio)
+        // Speed tracking for combined stream
+        let lastCombinedDownloaded = 0;
+        let lastCombinedSpeedTime = Date.now();
+        let combinedSpeed: number | null = null;
+
         onProgress({
           videoId: videoInfo.videoId,
-          phase: "downloading_video",
-          bytesDownloaded: 0,
-          totalBytes: streams.combined.contentLength
+          phase: "downloading",
+          videoBytesDownloaded: 0,
+          videoTotalBytes: streams.combined.contentLength
             ? parseInt(streams.combined.contentLength, 10)
             : null,
-          percentage: 0,
-          speed: null,
+          videoPercentage: 0,
+          videoSpeed: null,
+          audioBytesDownloaded: null,
+          audioTotalBytes: null,
+          audioPercentage: null,
+          audioSpeed: null,
         });
 
         const result = await downloader.downloadToFile(
@@ -468,13 +645,26 @@ export function createDownloadManager(
             signal: abortController.signal,
             rateLimit,
             onProgress: (downloaded, total) => {
+              // Calculate speed
+              const now = Date.now();
+              const elapsed = (now - lastCombinedSpeedTime) / 1000;
+              if (elapsed >= 0.5) {
+                combinedSpeed = (downloaded - lastCombinedDownloaded) / elapsed;
+                lastCombinedDownloaded = downloaded;
+                lastCombinedSpeedTime = now;
+              }
+
               onProgress({
                 videoId: videoInfo.videoId,
-                phase: "downloading_video",
-                bytesDownloaded: downloaded,
-                totalBytes: total,
-                percentage: total ? Math.round((downloaded / total) * 100) : null,
-                speed: null,
+                phase: "downloading",
+                videoBytesDownloaded: downloaded,
+                videoTotalBytes: total,
+                videoPercentage: total ? Math.round((downloaded / total) * 100) : null,
+                videoSpeed: combinedSpeed,
+                audioBytesDownloaded: null,
+                audioTotalBytes: null,
+                audioPercentage: null,
+                audioSpeed: null,
               });
             },
           },
@@ -499,10 +689,14 @@ export function createDownloadManager(
       onProgress({
         videoId: videoInfo.videoId,
         phase: "complete",
-        bytesDownloaded: finalSize,
-        totalBytes: finalSize,
-        percentage: 100,
-        speed: null,
+        videoBytesDownloaded: finalSize,
+        videoTotalBytes: finalSize,
+        videoPercentage: 100,
+        videoSpeed: null,
+        audioBytesDownloaded: null,
+        audioTotalBytes: null,
+        audioPercentage: null,
+        audioSpeed: null,
       });
 
       return {
@@ -510,6 +704,10 @@ export function createDownloadManager(
         filePath: paths.outputPath,
         fileSize: finalSize,
         duration: videoInfo.lengthSeconds,
+        videoItag: streams.video?.itag,
+        audioItag: streams.audio?.itag,
+        videoWidth: streams.video?.width,
+        videoHeight: streams.video?.height,
       };
     } catch (error) {
       // Clean up any temp files
@@ -615,23 +813,32 @@ export function createDownloadManager(
     videoId: string,
     title: string,
     phase: ActiveDownloadProgress["phase"],
-    bytesDownloaded: number,
-    totalBytes: number | null,
+    videoBytesDownloaded: number,
+    videoTotalBytes: number | null,
+    audioBytesDownloaded: number | null = null,
+    audioTotalBytes: number | null = null,
+    videoSpeed: number | null = null,
+    audioSpeed: number | null = null,
   ): void {
     const existing = activeProgress.get(videoId);
     const now = Date.now();
     const startedAt = existing?.startedAt ?? now;
-    const elapsed = (now - startedAt) / 1000;
-    const speed = elapsed > 0 ? bytesDownloaded / elapsed : null;
 
     activeProgress.set(videoId, {
       videoId,
       title,
       phase,
-      bytesDownloaded,
-      totalBytes,
-      percentage: totalBytes ? Math.round((bytesDownloaded / totalBytes) * 100) : null,
-      speed,
+      videoBytesDownloaded,
+      videoTotalBytes,
+      videoPercentage: videoTotalBytes ? Math.round((videoBytesDownloaded / videoTotalBytes) * 100) : null,
+      videoSpeed,
+      audioBytesDownloaded,
+      audioTotalBytes,
+      audioPercentage:
+        audioTotalBytes && audioBytesDownloaded !== null
+          ? Math.round((audioBytesDownloaded / audioTotalBytes) * 100)
+          : null,
+      audioSpeed,
       startedAt,
     });
   }

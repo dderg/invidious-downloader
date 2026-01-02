@@ -249,8 +249,12 @@ function startQueueProcessor(
       downloadManager.updateProgress(
         queueItem.videoId,
         videoInfo.title,
-        "downloading_video",
+        "downloading",
         0,
+        null,
+        0,
+        null,
+        null,
         null,
       );
 
@@ -264,13 +268,17 @@ function startQueueProcessor(
           downloadManager.updateProgress(
             queueItem.videoId,
             videoInfo.title,
-            progress.phase === "complete" || progress.phase === "failed" 
-              ? "muxing" 
+            progress.phase === "complete" || progress.phase === "failed"
+              ? "muxing"
               : progress.phase,
-            progress.bytesDownloaded,
-            progress.totalBytes,
+            progress.videoBytesDownloaded,
+            progress.videoTotalBytes,
+            progress.audioBytesDownloaded,
+            progress.audioTotalBytes,
+            progress.videoSpeed,
+            progress.audioSpeed,
           );
-          
+
           if (progress.phase === "complete") {
             log.info("Download complete", {
               videoId: queueItem.videoId,
@@ -305,6 +313,10 @@ function startQueueProcessor(
           author: videoInfo.author,
           description: videoInfo.description,
           viewCount: videoInfo.viewCount,
+          videoItag: downloadResult.videoItag,
+          audioItag: downloadResult.audioItag,
+          width: downloadResult.videoWidth,
+          height: downloadResult.videoHeight,
         },
         fileSizeBytes: downloadResult.fileSize,
       });

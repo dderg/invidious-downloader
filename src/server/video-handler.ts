@@ -188,6 +188,20 @@ export function buildVideoPath(videosPath: string, videoId: string): string {
 }
 
 /**
+ * Build the file path for a cached video stream by itag.
+ */
+export function buildVideoStreamPath(videosPath: string, videoId: string, itag: number): string {
+  return `${videosPath}/${videoId}_video_${itag}.mp4`;
+}
+
+/**
+ * Build the file path for a cached audio stream by itag.
+ */
+export function buildAudioStreamPath(videosPath: string, videoId: string, itag: number): string {
+  return `${videosPath}/${videoId}_audio_${itag}.m4a`;
+}
+
+/**
  * Build the file path for a cached thumbnail.
  */
 export function buildThumbnailPath(videosPath: string, videoId: string): string {
@@ -388,11 +402,202 @@ export function createVideoHandler(
     }
   }
 
+  /**
+   * Check if a video stream by itag is cached.
+   */
+  async function hasVideoStream(videoId: string, itag: number): Promise<boolean> {
+    const streamPath = buildVideoStreamPath(videosPath, videoId, itag);
+    return await fs.exists(streamPath);
+  }
+
+  /**
+   * Check if an audio stream by itag is cached.
+   */
+  async function hasAudioStream(videoId: string, itag: number): Promise<boolean> {
+    const streamPath = buildAudioStreamPath(videosPath, videoId, itag);
+    return await fs.exists(streamPath);
+  }
+
+  /**
+   * Serve a cached video stream by itag.
+   */
+  async function serveVideoStream(
+    videoId: string,
+    itag: number,
+    rangeHeader: string | null,
+  ): Promise<VideoServeResult> {
+    const streamPath = buildVideoStreamPath(videosPath, videoId, itag);
+
+    if (!(await fs.exists(streamPath))) {
+      return {
+        ok: false,
+        error: { type: "not_found", message: `Video stream ${videoId} itag ${itag} not found in cache` },
+      };
+    }
+
+    try {
+      const stat = await fs.stat(streamPath);
+      const fileSize = stat.size;
+      const mimeType = "video/mp4";
+
+      const headers = new Headers({
+        "Content-Type": mimeType,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=31536000",
+      });
+
+      if (stat.mtime) {
+        headers.set("Last-Modified", stat.mtime.toUTCString());
+      }
+
+      const range = parseRangeHeader(rangeHeader, fileSize);
+
+      if (range) {
+        const { start, end } = range;
+        const contentLength = end - start + 1;
+
+        headers.set("Content-Length", contentLength.toString());
+        headers.set("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+
+        const file = await fs.open(streamPath);
+        const stream = createRangeStream(file, start, contentLength);
+
+        return {
+          ok: true,
+          response: new Response(stream, { status: 206, headers }),
+        };
+      }
+
+      headers.set("Content-Length", fileSize.toString());
+      const file = await fs.open(streamPath);
+
+      return {
+        ok: true,
+        response: new Response(file.readable, { status: 200, headers }),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          type: "filesystem_error",
+          message: error instanceof Error ? error.message : "Unknown error",
+          cause: error,
+        },
+      };
+    }
+  }
+
+  /**
+   * Serve a cached audio stream by itag.
+   */
+  async function serveAudioStream(
+    videoId: string,
+    itag: number,
+    rangeHeader: string | null,
+  ): Promise<VideoServeResult> {
+    const streamPath = buildAudioStreamPath(videosPath, videoId, itag);
+
+    if (!(await fs.exists(streamPath))) {
+      return {
+        ok: false,
+        error: { type: "not_found", message: `Audio stream ${videoId} itag ${itag} not found in cache` },
+      };
+    }
+
+    try {
+      const stat = await fs.stat(streamPath);
+      const fileSize = stat.size;
+      const mimeType = "audio/mp4";
+
+      const headers = new Headers({
+        "Content-Type": mimeType,
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=31536000",
+      });
+
+      if (stat.mtime) {
+        headers.set("Last-Modified", stat.mtime.toUTCString());
+      }
+
+      const range = parseRangeHeader(rangeHeader, fileSize);
+
+      if (range) {
+        const { start, end } = range;
+        const contentLength = end - start + 1;
+
+        headers.set("Content-Length", contentLength.toString());
+        headers.set("Content-Range", `bytes ${start}-${end}/${fileSize}`);
+
+        const file = await fs.open(streamPath);
+        const stream = createRangeStream(file, start, contentLength);
+
+        return {
+          ok: true,
+          response: new Response(stream, { status: 206, headers }),
+        };
+      }
+
+      headers.set("Content-Length", fileSize.toString());
+      const file = await fs.open(streamPath);
+
+      return {
+        ok: true,
+        response: new Response(file.readable, { status: 200, headers }),
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        error: {
+          type: "filesystem_error",
+          message: error instanceof Error ? error.message : "Unknown error",
+          cause: error,
+        },
+      };
+    }
+  }
+
+  /**
+   * Find all cached streams for a video.
+   * Returns itags of available video and audio streams.
+   */
+  async function getCachedStreams(videoId: string): Promise<{ videoItags: number[]; audioItags: number[] }> {
+    const videoItags: number[] = [];
+    const audioItags: number[] = [];
+
+    try {
+      // List all files in videos directory
+      for await (const entry of Deno.readDir(videosPath)) {
+        if (!entry.isFile) continue;
+
+        // Check for video streams: {videoId}_video_{itag}.mp4
+        const videoMatch = entry.name.match(new RegExp(`^${videoId}_video_(\\d+)\\.mp4$`));
+        if (videoMatch) {
+          videoItags.push(parseInt(videoMatch[1], 10));
+        }
+
+        // Check for audio streams: {videoId}_audio_{itag}.m4a
+        const audioMatch = entry.name.match(new RegExp(`^${videoId}_audio_(\\d+)\\.m4a$`));
+        if (audioMatch) {
+          audioItags.push(parseInt(audioMatch[1], 10));
+        }
+      }
+    } catch {
+      // Directory doesn't exist or can't be read
+    }
+
+    return { videoItags, audioItags };
+  }
+
   return {
     isCached,
     serveVideo,
     serveThumbnail,
     getMetadata,
+    hasVideoStream,
+    hasAudioStream,
+    serveVideoStream,
+    serveAudioStream,
+    getCachedStreams,
     videosPath,
   };
 }

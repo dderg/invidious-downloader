@@ -252,12 +252,49 @@ export const dashboardHtml = `<!DOCTYPE html>
       border-radius: 2px;
       margin-top: 8px;
       overflow: hidden;
+      flex: 1;
     }
     
     .progress-fill {
       height: 100%;
       background: var(--accent);
       transition: width 0.3s;
+    }
+    
+    .progress-fill.audio {
+      background: #9c27b0;
+    }
+    
+    .dual-progress {
+      margin-top: 8px;
+    }
+    
+    .progress-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-bottom: 4px;
+    }
+    
+    .progress-label {
+      font-size: 11px;
+      width: 40px;
+      color: var(--text-muted);
+    }
+    
+    .progress-pct {
+      font-size: 11px;
+      width: 35px;
+      text-align: right;
+      color: var(--text-muted);
+    }
+    
+    .progress-speed {
+      font-size: 11px;
+      width: 70px;
+      text-align: right;
+      color: var(--accent);
+      font-weight: 500;
     }
     
     .toast {
@@ -523,6 +560,7 @@ export const dashboardHtml = `<!DOCTYPE html>
     
     function getPhaseLabel(phase) {
       const labels = {
+        'downloading': 'Downloading',
         'downloading_video': 'Downloading video',
         'downloading_audio': 'Downloading audio',
         'muxing': 'Muxing...',
@@ -545,17 +583,66 @@ export const dashboardHtml = `<!DOCTYPE html>
       list.innerHTML = data.items.map(item => {
         // Get progress info for this item if it's actively downloading
         const progress = currentProgress[item.videoId];
-        const percentage = progress?.percentage ?? 0;
         const phase = progress?.phase ?? item.status;
-        const speed = progress?.speed;
-        const downloaded = progress?.bytesDownloaded ?? 0;
-        const total = progress?.totalBytes;
         const title = progress?.title || item.title || item.videoId;
         
+        // Video progress
+        const videoPercentage = progress?.videoPercentage ?? 0;
+        const videoDownloaded = progress?.videoBytesDownloaded ?? 0;
+        const videoTotal = progress?.videoTotalBytes;
+        const videoSpeed = progress?.videoSpeed;
+        
+        // Audio progress (null if combined stream)
+        const audioPercentage = progress?.audioPercentage ?? null;
+        const audioDownloaded = progress?.audioBytesDownloaded ?? null;
+        const audioTotal = progress?.audioTotalBytes ?? null;
+        const audioSpeed = progress?.audioSpeed;
+        const hasAudio = audioDownloaded !== null;
+        
         const isActive = item.status === 'downloading' || item.status === 'muxing';
-        const progressText = isActive && progress 
-          ? \`\${getPhaseLabel(phase)} - \${formatBytes(downloaded)}\${total ? ' / ' + formatBytes(total) : ''}\${speed ? ' (' + formatSpeed(speed) + ')' : ''}\`
-          : '';
+        
+        // Build progress HTML
+        let progressHtml = '';
+        if (isActive && progress) {
+          const phaseLabel = getPhaseLabel(phase);
+          
+          if (hasAudio) {
+            // Dual progress bars for separate video + audio with individual speeds
+            const videoSpeedText = videoSpeed ? formatSpeed(videoSpeed) : '';
+            const audioSpeedText = audioSpeed ? formatSpeed(audioSpeed) : '';
+            
+            progressHtml = \`
+              <div class="item-meta progress-text" style="color: var(--accent)">\${phaseLabel}</div>
+              <div class="dual-progress">
+                <div class="progress-row">
+                  <span class="progress-label">Video</span>
+                  <div class="progress-bar">
+                    <div class="progress-fill video-fill" style="width: \${videoPercentage}%"></div>
+                  </div>
+                  <span class="progress-pct video-pct">\${videoPercentage}%</span>
+                  <span class="progress-speed video-speed">\${videoSpeedText}</span>
+                </div>
+                <div class="progress-row">
+                  <span class="progress-label">Audio</span>
+                  <div class="progress-bar">
+                    <div class="progress-fill audio audio-fill" style="width: \${audioPercentage ?? 0}%"></div>
+                  </div>
+                  <span class="progress-pct audio-pct">\${audioPercentage ?? 0}%</span>
+                  <span class="progress-speed audio-speed">\${audioSpeedText}</span>
+                </div>
+              </div>
+            \`;
+          } else {
+            // Single progress bar for combined stream
+            const speedText = videoSpeed ? ' (' + formatSpeed(videoSpeed) + ')' : '';
+            progressHtml = \`
+              <div class="item-meta progress-text" style="color: var(--accent)">\${phaseLabel} - \${formatBytes(videoDownloaded)}\${videoTotal ? ' / ' + formatBytes(videoTotal) : ''}\${speedText}</div>
+              <div class="progress-bar">
+                <div class="progress-fill video-fill" style="width: \${videoPercentage}%"></div>
+              </div>
+            \`;
+          }
+        }
         
         return \`
           <li class="queue-item" data-video-id="\${item.videoId}">
@@ -569,12 +656,7 @@ export const dashboardHtml = `<!DOCTYPE html>
                 &bull; Added \${formatDate(item.queuedAt)}
                 \${item.errorMessage ? '&bull; <span style="color: var(--error)">' + item.errorMessage + '</span>' : ''}
               </div>
-              \${isActive ? \`
-                <div class="item-meta progress-text" style="color: var(--accent)">\${progressText}</div>
-                <div class="progress-bar">
-                  <div class="progress-fill" style="width: \${percentage}%"></div>
-                </div>
-              \` : ''}
+              \${progressHtml}
             </div>
             <span class="item-status status-\${item.status}">\${item.status}</span>
             <div class="item-actions">
@@ -705,13 +787,43 @@ export const dashboardHtml = `<!DOCTYPE html>
           // Only update progress bars and text, not the whole list
           for (const videoId of Object.keys(currentProgress)) {
             const p = currentProgress[videoId];
-            const progressBar = document.querySelector(\`[data-video-id="\${videoId}"] .progress-fill\`);
-            const progressText = document.querySelector(\`[data-video-id="\${videoId}"] .progress-text\`);
-            if (progressBar) {
-              progressBar.style.width = (p.percentage || 0) + '%';
+            const item = document.querySelector(\`[data-video-id="\${videoId}"]\`);
+            if (!item) continue;
+            
+            // Update video progress bar
+            const videoFill = item.querySelector('.video-fill');
+            const videoPct = item.querySelector('.video-pct');
+            if (videoFill) {
+              videoFill.style.width = (p.videoPercentage || 0) + '%';
             }
+            if (videoPct) {
+              videoPct.textContent = (p.videoPercentage || 0) + '%';
+            }
+            
+            // Update audio progress bar (if exists)
+            const audioFill = item.querySelector('.audio-fill');
+            const audioPct = item.querySelector('.audio-pct');
+            if (audioFill && p.audioPercentage !== null) {
+              audioFill.style.width = (p.audioPercentage || 0) + '%';
+            }
+            if (audioPct && p.audioPercentage !== null) {
+              audioPct.textContent = (p.audioPercentage || 0) + '%';
+            }
+            
+            // Update speed displays
+            const videoSpeedEl = item.querySelector('.video-speed');
+            const audioSpeedEl = item.querySelector('.audio-speed');
+            if (videoSpeedEl) {
+              videoSpeedEl.textContent = p.videoSpeed ? formatSpeed(p.videoSpeed) : '';
+            }
+            if (audioSpeedEl && p.audioSpeed !== undefined) {
+              audioSpeedEl.textContent = p.audioSpeed ? formatSpeed(p.audioSpeed) : '';
+            }
+            
+            // Update progress text (phase label only)
+            const progressText = item.querySelector('.progress-text');
             if (progressText) {
-              progressText.textContent = \`\${getPhaseLabel(p.phase)} - \${formatBytes(p.bytesDownloaded)}\${p.totalBytes ? ' / ' + formatBytes(p.totalBytes) : ''}\${p.speed ? ' (' + formatSpeed(p.speed) + ')' : ''}\`;
+              progressText.textContent = getPhaseLabel(p.phase);
             }
           }
         }
