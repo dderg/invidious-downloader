@@ -42,6 +42,8 @@ describe("parseConfig", () => {
         assertEquals(result.config.downloadQuality, "best");
         assertEquals(result.config.downloadRateLimit, 0);
         assertEquals(result.config.maxConcurrentDownloads, 2);
+        assertEquals(result.config.maxRetryAttempts, 3);
+        assertEquals(result.config.retryBaseDelayMinutes, 1);
         // checkIntervalMinutes has a default but we don't test the specific value
         assertEquals(typeof result.config.checkIntervalMinutes, "number");
         assertEquals(result.config.checkIntervalMinutes > 0, true);
@@ -57,6 +59,8 @@ describe("parseConfig", () => {
         DOWNLOAD_RATE_LIMIT: "5000000",
         CHECK_INTERVAL_MINUTES: "60",
         MAX_CONCURRENT_DOWNLOADS: "4",
+        MAX_RETRY_ATTEMPTS: "5",
+        RETRY_BASE_DELAY_MINUTES: "2",
       });
 
       assertEquals(result.ok, true);
@@ -67,6 +71,8 @@ describe("parseConfig", () => {
         assertEquals(result.config.downloadRateLimit, 5000000);
         assertEquals(result.config.checkIntervalMinutes, 60);
         assertEquals(result.config.maxConcurrentDownloads, 4);
+        assertEquals(result.config.maxRetryAttempts, 5);
+        assertEquals(result.config.retryBaseDelayMinutes, 2);
       }
     });
 
@@ -208,6 +214,36 @@ describe("parseConfig", () => {
       if (!result.ok) {
         const error = result.errors.find(
           (e) => e.field === "MAX_CONCURRENT_DOWNLOADS",
+        );
+        assertExists(error);
+      }
+    });
+
+    it("should return error for zero MAX_RETRY_ATTEMPTS", () => {
+      const result = parseConfig({
+        ...validInput,
+        MAX_RETRY_ATTEMPTS: "0",
+      });
+
+      assertEquals(result.ok, false);
+      if (!result.ok) {
+        const error = result.errors.find(
+          (e) => e.field === "MAX_RETRY_ATTEMPTS",
+        );
+        assertExists(error);
+      }
+    });
+
+    it("should return error for negative RETRY_BASE_DELAY_MINUTES", () => {
+      const result = parseConfig({
+        ...validInput,
+        RETRY_BASE_DELAY_MINUTES: "-1",
+      });
+
+      assertEquals(result.ok, false);
+      if (!result.ok) {
+        const error = result.errors.find(
+          (e) => e.field === "RETRY_BASE_DELAY_MINUTES",
         );
         assertExists(error);
       }

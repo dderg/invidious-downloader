@@ -336,6 +336,8 @@ describe("mapQueueRow", () => {
       queued_at: "2024-01-01T00:00:00.000Z",
       started_at: "2024-01-01T00:01:00.000Z",
       completed_at: null,
+      retry_count: 0,
+      next_retry_at: null,
     };
 
     const result = mapQueueRow(row);
@@ -347,6 +349,8 @@ describe("mapQueueRow", () => {
     assertEquals(result.errorMessage, null);
     assertEquals(result.startedAt instanceof Date, true);
     assertEquals(result.completedAt, null);
+    assertEquals(result.retryCount, 0);
+    assertEquals(result.nextRetryAt, null);
   });
 });
 

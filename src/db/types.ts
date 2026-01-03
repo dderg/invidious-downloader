@@ -120,6 +120,8 @@ export interface QueueItem {
   queuedAt: Date;
   startedAt: Date | null;
   completedAt: Date | null;
+  retryCount: number;
+  nextRetryAt: Date | null;
 }
 
 // ============================================================================

@@ -341,7 +341,7 @@ describe("createSubscriptionWatcher", () => {
       getDownloads: () => ({ ok: true, data: [] }),
       deleteDownload: () => ({ ok: true, data: true }),
       getDownloadStats: () => ({ ok: true, data: { count: 0, totalBytes: 0 } }),
-      addToQueue: () => ({ ok: true, data: { id: 1, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null } }),
+      addToQueue: () => ({ ok: true, data: { id: 1, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null, retryCount: 0, nextRetryAt: null } }),
       getQueue: () => ({ ok: true, data: [] }),
       getNextQueueItem: () => ({ ok: true, data: null }),
       updateQueueStatus: () => ({ ok: true, data: {} }),
@@ -428,7 +428,7 @@ describe("createSubscriptionWatcher", () => {
         localDb: createMockLocalDb({
           addToQueue: () => {
             queuedCount++;
-            return { ok: true, data: { id: queuedCount, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null } };
+            return { ok: true, data: { id: queuedCount, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null, retryCount: 0, nextRetryAt: null } };
           },
         }),
       });

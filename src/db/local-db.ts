@@ -87,6 +87,17 @@ CREATE INDEX IF NOT EXISTS idx_queue_status ON download_queue(status);
 CREATE INDEX IF NOT EXISTS idx_queue_priority ON download_queue(priority DESC, queued_at ASC);
 `;
 
+// Migration SQL to add retry columns to existing databases
+const MIGRATION_RETRY_COLUMNS_SQL = `
+-- Add retry_count column if it doesn't exist
+ALTER TABLE download_queue ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0;
+`;
+
+const MIGRATION_NEXT_RETRY_AT_SQL = `
+-- Add next_retry_at column if it doesn't exist
+ALTER TABLE download_queue ADD COLUMN next_retry_at TEXT;
+`;
+
 // ============================================================================
 // Row Mappers (pure functions)
 // ============================================================================
@@ -115,6 +126,8 @@ interface QueueRow {
   queued_at: string;
   started_at: string | null;
   completed_at: string | null;
+  retry_count: number;
+  next_retry_at: string | null;
 }
 
 interface ExclusionRow {
@@ -163,6 +176,8 @@ export function mapQueueRow(row: QueueRow): QueueItem {
     queuedAt: new Date(row.queued_at),
     startedAt: row.started_at ? new Date(row.started_at) : null,
     completedAt: row.completed_at ? new Date(row.completed_at) : null,
+    retryCount: row.retry_count ?? 0,
+    nextRetryAt: row.next_retry_at ? new Date(row.next_retry_at) : null,
   };
 }
 
@@ -232,6 +247,19 @@ export function createLocalDb(executor: SqliteExecutor) {
   function init(): DbResult<void> {
     try {
       executor.execute(SCHEMA_SQL);
+      
+      // Run migrations for retry columns (safe to run multiple times - fails silently if column exists)
+      try {
+        executor.execute(MIGRATION_RETRY_COLUMNS_SQL);
+      } catch {
+        // Column already exists, ignore
+      }
+      try {
+        executor.execute(MIGRATION_NEXT_RETRY_AT_SQL);
+      } catch {
+        // Column already exists, ignore
+      }
+      
       return okResult(undefined);
     } catch (error) {
       return errorResult(
@@ -522,12 +550,14 @@ export function createLocalDb(executor: SqliteExecutor) {
 
   /**
    * Get next pending item from queue.
+   * Only returns items that are ready to process (no pending retry delay).
    */
   function getNextQueueItem(): DbResult<QueueItem | null> {
     try {
       const sql = `
         SELECT * FROM download_queue
         WHERE status = 'pending'
+          AND (next_retry_at IS NULL OR datetime(next_retry_at) <= datetime('now'))
         ORDER BY priority DESC, queued_at ASC
         LIMIT 1
       `;
@@ -659,6 +689,72 @@ export function createLocalDb(executor: SqliteExecutor) {
       return errorResult(
         "query_error",
         `Failed to clear queue: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Schedule a retry for a failed download.
+   * Sets status back to 'pending' with a future retry time.
+   */
+  function scheduleRetry(
+    videoId: string,
+    errorMessage: string,
+    retryCount: number,
+    nextRetryAt: Date,
+  ): DbResult<QueueItem | null> {
+    try {
+      const sql = `
+        UPDATE download_queue
+        SET status = 'pending',
+            error_message = ?,
+            retry_count = ?,
+            next_retry_at = ?,
+            completed_at = NULL
+        WHERE video_id = ?
+        RETURNING *
+      `;
+      const params = [
+        errorMessage,
+        retryCount,
+        nextRetryAt.toISOString(),
+        videoId,
+      ];
+      const row = executor.queryOne<QueueRow>(sql, params);
+      return okResult(row ? mapQueueRow(row) : null);
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to schedule retry: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Reset retry count for a video (used when manually retrying).
+   * Clears error message and sets status back to pending.
+   */
+  function resetRetryCount(videoId: string): DbResult<QueueItem | null> {
+    try {
+      const sql = `
+        UPDATE download_queue
+        SET status = 'pending',
+            retry_count = 0,
+            next_retry_at = NULL,
+            error_message = NULL,
+            started_at = NULL,
+            completed_at = NULL
+        WHERE video_id = ?
+        RETURNING *
+      `;
+      const row = executor.queryOne<QueueRow>(sql, [videoId]);
+      return okResult(row ? mapQueueRow(row) : null);
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to reset retry count: ${error instanceof Error ? error.message : "Unknown error"}`,
         error,
       );
     }
@@ -803,6 +899,8 @@ export function createLocalDb(executor: SqliteExecutor) {
     isInQueue,
     getQueueItem,
     clearCompletedQueue,
+    scheduleRetry,
+    resetRetryCount,
     // Exclusions
     addExclusion,
     removeExclusion,

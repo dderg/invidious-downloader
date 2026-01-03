@@ -124,6 +124,14 @@ export function renderQueueList(items: QueueItem[], progress: Map<string, Active
 }
 
 /**
+ * Format time for display (e.g., "10:30 AM").
+ */
+export function formatTime(date: string | Date): string {
+  const dateObj = typeof date === 'string' ? new Date(date) : date;
+  return dateObj.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+}
+
+/**
  * Render a single queue item.
  */
 export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgress): string {
@@ -136,9 +144,33 @@ export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgre
     progressHtml = renderProgressSection(item.videoId, progress);
   }
 
+  // Build status display and retry information
+  let statusDisplay: string = item.status;
+  let statusClass: string = item.status;
+  let retryInfo = "";
+
+  if (item.status === "pending" && item.retryCount > 0 && item.nextRetryAt) {
+    // Scheduled retry - show when it will retry
+    statusDisplay = "retry scheduled";
+    statusClass = "retry";
+    const retryTime = formatTime(item.nextRetryAt);
+    retryInfo = `Retry ${item.retryCount}/3 scheduled for ${retryTime}`;
+  } else if (item.status === "failed") {
+    // Failed - show attempt count if retried
+    if (item.retryCount > 0) {
+      retryInfo = `after ${item.retryCount} attempt${item.retryCount > 1 ? "s" : ""}`;
+    }
+  }
+
+  // Error message display
   const errorHtml = item.errorMessage 
-    ? `&bull; <span style="color: var(--error)">${escapeHtml(item.errorMessage)}</span>` 
+    ? `<span class="error-text">${escapeHtml(item.errorMessage)}</span>` 
     : "";
+
+  // Build meta line
+  const metaParts = [`Added ${formatDate(item.queuedAt)}`];
+  if (retryInfo) metaParts.push(retryInfo);
+  const metaLine = metaParts.join(" &bull; ");
 
   return `
 <li class="queue-item" id="queue-item-${item.videoId}" data-video-id="${item.videoId}">
@@ -147,13 +179,11 @@ export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgre
   </div>
   <div class="item-info">
     <div class="item-title">${title}</div>
-    <div class="item-meta">
-      Added ${formatDate(item.queuedAt)}
-      ${errorHtml}
-    </div>
+    <div class="item-meta">${metaLine}</div>
+    ${errorHtml ? `<div class="item-meta">${errorHtml}</div>` : ""}
     ${progressHtml}
   </div>
-  <span class="item-status status-${item.status}">${item.status}</span>
+  <span class="item-status status-${statusClass}">${statusDisplay}</span>
   <div class="item-actions">
     ${item.status === "pending" || item.status === "downloading" ? `
       <button class="secondary" hx-delete="/api/downloader/queue/${item.videoId}" hx-swap="none">Cancel</button>
@@ -229,7 +259,7 @@ export function renderProgressBars(progress: Map<string, ActiveDownloadProgress>
 /**
  * Render toast notification with OOB swap.
  */
-export function renderToast(message: string, variant: "success" | "error"): string {
+export function renderToast(message: string, variant: "success" | "error" | "warning"): string {
   const id = `toast-${Date.now()}`;
   return `
 <div id="toast-container" hx-swap-oob="beforeend">
@@ -633,6 +663,12 @@ export function renderDashboardPage(data: DashboardData): string {
     .status-failed { background: var(--error); color: #000; }
     .status-cancelled { background: var(--border); color: var(--text); }
     .status-muxing { background: #9c27b0; color: #fff; }
+    .status-retry { background: #ff9800; color: #000; }
+    
+    .error-text {
+      color: var(--error);
+      font-size: 12px;
+    }
     
     /* Badges for MP4/DASH status */
     .badge {
@@ -775,6 +811,7 @@ export function renderDashboardPage(data: DashboardData): string {
     
     .toast.success { border-color: var(--success); }
     .toast.error { border-color: var(--error); }
+    .toast.warning { border-color: var(--warning); }
     
     .toast-action {
       margin-left: 12px;

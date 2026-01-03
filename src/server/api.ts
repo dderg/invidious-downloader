@@ -187,13 +187,22 @@ export function createApiRouter(deps: ApiDependencies) {
       const status = queueItem.data.status;
       
       // If video is actively being processed, reject
-      if (status === "pending" || status === "downloading") {
+      if (status === "downloading") {
+        return c.json({ error: "Video is currently downloading" }, 409);
+      }
+      
+      // If video is pending (including scheduled retries), reject
+      if (status === "pending") {
         return c.json({ error: "Video already in queue" }, 409);
       }
       
-      // If video failed or was cancelled, remove from queue to allow retry
+      // If video failed or was cancelled, reset retry count and re-queue
       if (status === "failed" || status === "cancelled") {
-        db.removeFromQueue(body.videoId);
+        const resetResult = db.resetRetryCount(body.videoId);
+        if (!resetResult.ok) {
+          return c.json({ error: resetResult.error.message }, 500);
+        }
+        return c.json(resetResult.data, 200);
       }
     }
 

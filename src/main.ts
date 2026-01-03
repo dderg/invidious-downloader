@@ -199,6 +199,119 @@ type DownloadManagerType = ReturnType<typeof createDownloadManager>;
 type LocalDbType = ReturnType<typeof createLocalDb>;
 type WebSocketManagerType = ReturnType<typeof createServer>["wsManager"];
 
+// ============================================================================
+// Error Classification for Retry Logic
+// ============================================================================
+
+/**
+ * Error categories for retry logic.
+ * - "transient": Network issues, rate limiting - worth retrying
+ * - "temporary": Video processing, not available yet - retry with longer delay
+ * - "permanent": Video deleted, private, age-restricted - don't auto-retry
+ */
+type ErrorCategory = "transient" | "temporary" | "permanent";
+
+/**
+ * Classify an error message to determine retry behavior.
+ * Even "permanent" errors can still be manually retried.
+ */
+function classifyError(errorMessage: string): ErrorCategory {
+  const permanentPatterns = [
+    /video.*unavailable/i,
+    /video.*private/i,
+    /video.*deleted/i,
+    /removed/i,
+    /age.*restrict/i,
+    /copyright/i,
+    /blocked/i,
+    /sign.?in/i,
+    /login.*required/i,
+    /members.?only/i,
+  ];
+
+  const temporaryPatterns = [
+    /no.*suitable.*stream/i,
+    /no.*streams.*found/i,
+    /processing/i,
+    /try.*later/i,
+    /temporarily/i,
+  ];
+
+  const lowerMessage = errorMessage.toLowerCase();
+
+  for (const pattern of permanentPatterns) {
+    if (pattern.test(lowerMessage)) return "permanent";
+  }
+  for (const pattern of temporaryPatterns) {
+    if (pattern.test(lowerMessage)) return "temporary";
+  }
+  return "transient";
+}
+
+/**
+ * Handle a download failure with retry logic.
+ */
+function handleDownloadFailure(
+  videoId: string,
+  title: string,
+  errorMessage: string,
+  currentRetryCount: number,
+  config: Config,
+  localDb: LocalDbType,
+  wsManager: WebSocketManagerType,
+  downloadManager: DownloadManagerType,
+): void {
+  const errorCategory = classifyError(errorMessage);
+
+  if (errorCategory === "permanent") {
+    // Don't auto-retry permanent errors, but user can still manually retry
+    localDb.updateQueueStatus(videoId, "failed", errorMessage);
+    log.warn("Download failed (permanent error, not retrying)", {
+      videoId,
+      error: errorMessage,
+    });
+    wsManager.broadcastToast(`Failed: "${title}" - ${errorMessage}`, "error");
+  } else if (currentRetryCount >= config.maxRetryAttempts) {
+    // Max retries reached
+    localDb.updateQueueStatus(
+      videoId,
+      "failed",
+      `${errorMessage} (max retries reached)`,
+    );
+    log.warn("Download failed (max retries reached)", {
+      videoId,
+      attempts: currentRetryCount,
+      error: errorMessage,
+    });
+    wsManager.broadcastToast(
+      `Failed after ${currentRetryCount} attempts: "${title}"`,
+      "error",
+    );
+  } else {
+    // Schedule retry with exponential backoff: 1 → 4 → 16 minutes
+    const newRetryCount = currentRetryCount + 1;
+    const delayMinutes =
+      config.retryBaseDelayMinutes * Math.pow(4, newRetryCount - 1);
+    const nextRetryAt = new Date(Date.now() + delayMinutes * 60 * 1000);
+
+    localDb.scheduleRetry(videoId, errorMessage, newRetryCount, nextRetryAt);
+
+    log.info("Scheduled retry", {
+      videoId,
+      attempt: newRetryCount,
+      maxAttempts: config.maxRetryAttempts,
+      delayMinutes,
+      nextRetryAt: nextRetryAt.toISOString(),
+    });
+    wsManager.broadcastToast(
+      `Retry ${newRetryCount}/${config.maxRetryAttempts} for "${title}" in ${delayMinutes} min`,
+      "warning",
+    );
+  }
+
+  broadcastDashboardUpdate(wsManager, localDb, downloadManager);
+}
+
 /**
  * Helper to broadcast dashboard stats via WebSocket.
  */
@@ -263,13 +376,20 @@ function startQueueProcessor(
       // Get video info from Companion
       const infoResult = await companionClient.getVideoInfo(queueItem.videoId);
       if (!infoResult.ok) {
-        localDb.updateQueueStatus(queueItem.videoId, "failed", infoResult.error.message);
         log.error("Failed to get video info", {
           videoId: queueItem.videoId,
           error: infoResult.error.message,
         });
-        broadcastDashboardUpdate(wsManager, localDb, downloadManager);
-        wsManager.broadcastToast(`Failed to get info for ${queueItem.videoId}`, "error");
+        handleDownloadFailure(
+          queueItem.videoId,
+          queueItem.videoId, // Use videoId as title since we don't have it yet
+          infoResult.error.message,
+          queueItem.retryCount,
+          config,
+          localDb,
+          wsManager,
+          downloadManager,
+        );
         return;
       }
 
@@ -278,10 +398,17 @@ function startQueueProcessor(
       // Select best streams
       const streams = selectBestStreams(videoInfo, config.downloadQuality as QualityPreference);
       if (!streams.video && !streams.audio && !streams.combined) {
-        localDb.updateQueueStatus(queueItem.videoId, "failed", "No suitable streams found");
         log.error("No suitable streams", { videoId: queueItem.videoId });
-        broadcastDashboardUpdate(wsManager, localDb, downloadManager);
-        wsManager.broadcastToast(`No suitable streams for "${videoInfo.title}"`, "error");
+        handleDownloadFailure(
+          queueItem.videoId,
+          videoInfo.title,
+          "No suitable streams found",
+          queueItem.retryCount,
+          config,
+          localDb,
+          wsManager,
+          downloadManager,
+        );
         return;
       }
 
@@ -337,13 +464,20 @@ function startQueueProcessor(
       downloadManager.removeProgress(queueItem.videoId);
 
       if (!downloadResult.ok) {
-        localDb.updateQueueStatus(queueItem.videoId, "failed", downloadResult.error.message);
         log.error("Download failed", {
           videoId: queueItem.videoId,
           error: downloadResult.error.message,
         });
-        broadcastDashboardUpdate(wsManager, localDb, downloadManager);
-        wsManager.broadcastToast(`Download failed: "${videoInfo.title}"`, "error");
+        handleDownloadFailure(
+          queueItem.videoId,
+          videoInfo.title,
+          downloadResult.error.message,
+          queueItem.retryCount,
+          config,
+          localDb,
+          wsManager,
+          downloadManager,
+        );
         return;
       }
 
@@ -388,17 +522,23 @@ function startQueueProcessor(
       broadcastDashboardUpdate(wsManager, localDb, downloadManager);
       wsManager.broadcastDownloadComplete(queueItem.videoId, videoInfo.title);
     } catch (err) {
-      localDb.updateQueueStatus(
-        queueItem.videoId,
-        "failed",
-        err instanceof Error ? err.message : String(err),
-      );
+      const errorMessage = err instanceof Error ? err.message : String(err);
       log.error("Queue processing error", {
         videoId: queueItem.videoId,
-        error: err instanceof Error ? err.message : String(err),
+        error: errorMessage,
       });
-      broadcastDashboardUpdate(wsManager, localDb, downloadManager);
-      wsManager.broadcastToast(`Error: ${err instanceof Error ? err.message : String(err)}`, "error");
+      // Note: We may not have videoInfo.title here if the error occurred early
+      // The handleDownloadFailure function will use videoId as fallback title
+      handleDownloadFailure(
+        queueItem.videoId,
+        queueItem.videoId, // Use videoId as title (videoInfo might not be available)
+        errorMessage,
+        queueItem.retryCount,
+        config,
+        localDb,
+        wsManager,
+        downloadManager,
+      );
     } finally {
       isProcessing = false;
     }

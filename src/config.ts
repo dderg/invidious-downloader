@@ -18,6 +18,8 @@ export interface Config {
   downloadRateLimit: number; // bytes/sec, 0 = unlimited
   checkIntervalMinutes: number;
   maxConcurrentDownloads: number;
+  maxRetryAttempts: number; // max automatic retries before permanent failure
+  retryBaseDelayMinutes: number; // base delay for exponential backoff (1 → 4 → 16 min)
 }
 
 export interface ConfigInput {
@@ -32,6 +34,8 @@ export interface ConfigInput {
   DOWNLOAD_RATE_LIMIT?: string;
   CHECK_INTERVAL_MINUTES?: string;
   MAX_CONCURRENT_DOWNLOADS?: string;
+  MAX_RETRY_ATTEMPTS?: string;
+  RETRY_BASE_DELAY_MINUTES?: string;
 }
 
 export class ConfigError extends Error {
@@ -118,6 +122,24 @@ export function parseConfig(input: ConfigInput): ConfigResult {
     errors.push(maxConcurrentDownloads.error);
   }
 
+  const maxRetryAttempts = parsePositiveInt(
+    input.MAX_RETRY_ATTEMPTS,
+    "MAX_RETRY_ATTEMPTS",
+    3,
+  );
+  if (maxRetryAttempts.error) {
+    errors.push(maxRetryAttempts.error);
+  }
+
+  const retryBaseDelayMinutes = parsePositiveInt(
+    input.RETRY_BASE_DELAY_MINUTES,
+    "RETRY_BASE_DELAY_MINUTES",
+    1,
+  );
+  if (retryBaseDelayMinutes.error) {
+    errors.push(retryBaseDelayMinutes.error);
+  }
+
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -136,6 +158,8 @@ export function parseConfig(input: ConfigInput): ConfigResult {
       downloadRateLimit: downloadRateLimit.value!,
       checkIntervalMinutes: checkIntervalMinutes.value!,
       maxConcurrentDownloads: maxConcurrentDownloads.value!,
+      maxRetryAttempts: maxRetryAttempts.value!,
+      retryBaseDelayMinutes: retryBaseDelayMinutes.value!,
     },
   };
 }
@@ -157,6 +181,8 @@ export function loadConfigFromEnv(): ConfigResult {
     DOWNLOAD_RATE_LIMIT: Deno.env.get("DOWNLOAD_RATE_LIMIT"),
     CHECK_INTERVAL_MINUTES: Deno.env.get("CHECK_INTERVAL_MINUTES"),
     MAX_CONCURRENT_DOWNLOADS: Deno.env.get("MAX_CONCURRENT_DOWNLOADS"),
+    MAX_RETRY_ATTEMPTS: Deno.env.get("MAX_RETRY_ATTEMPTS"),
+    RETRY_BASE_DELAY_MINUTES: Deno.env.get("RETRY_BASE_DELAY_MINUTES"),
   });
 }
 

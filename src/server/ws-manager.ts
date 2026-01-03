@@ -39,7 +39,7 @@ export type DashboardEvent =
   | { type: "queue"; data: { items: QueueItem[]; progress: Map<string, ActiveDownloadProgress> } }
   | { type: "progress"; data: Map<string, ActiveDownloadProgress> }
   | { type: "download-complete"; data: { videoId: string; title: string } }
-  | { type: "toast"; data: { message: string; variant: "success" | "error" } };
+  | { type: "toast"; data: { message: string; variant: "success" | "error" | "warning" } };
 
 // ============================================================================
 // WebSocket Manager
@@ -126,7 +126,7 @@ export function createWebSocketManager() {
   /**
    * Broadcast toast notification.
    */
-  function broadcastToast(message: string, variant: "success" | "error"): void {
+  function broadcastToast(message: string, variant: "success" | "error" | "warning"): void {
     broadcast(renderToast(message, variant));
   }
 

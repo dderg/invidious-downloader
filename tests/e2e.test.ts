@@ -47,6 +47,8 @@ function createTestConfig(overrides: Partial<Config> = {}): Config {
     downloadRateLimit: 0,
     checkIntervalMinutes: 30,
     maxConcurrentDownloads: 2,
+    maxRetryAttempts: 3,
+    retryBaseDelayMinutes: 1,
     ...overrides,
   };
 }
