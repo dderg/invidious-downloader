@@ -289,6 +289,8 @@ describe("mapDownloadRow", () => {
       metadata: '{"author":"Test Author"}',
       downloaded_at: "2024-01-01T00:00:00.000Z",
       file_size_bytes: 100000000,
+      source: "manual",
+      files_deleted_at: null,
     };
 
     const result = mapDownloadRow(row);
@@ -317,6 +319,8 @@ describe("mapDownloadRow", () => {
       metadata: "invalid json",
       downloaded_at: "2024-01-01T00:00:00.000Z",
       file_size_bytes: 1000,
+      source: "manual",
+      files_deleted_at: null,
     };
 
     const result = mapDownloadRow(row);
@@ -338,6 +342,8 @@ describe("mapQueueRow", () => {
       completed_at: null,
       retry_count: 0,
       next_retry_at: null,
+      source: "manual",
+      throttle_retry_count: 0,
     };
 
     const result = mapQueueRow(row);
@@ -351,6 +357,7 @@ describe("mapQueueRow", () => {
     assertEquals(result.completedAt, null);
     assertEquals(result.retryCount, 0);
     assertEquals(result.nextRetryAt, null);
+    assertEquals(result.throttleRetryCount, 0);
   });
 });
 

@@ -50,6 +50,15 @@ export interface DownloadOptions {
   rateLimit?: number;
   /** Optional: progress callback */
   onProgress?: (progress: DownloadProgress) => void;
+  /** Optional: attempt to resume from existing partial files */
+  resume?: boolean;
+  /** Optional: throttle detection config (only applied to video stream) */
+  throttleConfig?: {
+    /** Minimum speed in bytes/sec before considering throttled */
+    speedThreshold: number;
+    /** Seconds to measure rolling average */
+    detectionWindow: number;
+  };
 }
 
 /**
@@ -151,6 +160,30 @@ export const defaultFileSystem: FileSystem = {
 // ============================================================================
 
 /**
+ * Result of a download operation.
+ */
+export interface HttpDownloadResult {
+  ok: true;
+  /** Total bytes written to file */
+  size: number;
+  /** Whether the download was resumed from an existing partial file */
+  resumed: boolean;
+  /** Bytes that were already downloaded before this operation (if resumed) */
+  resumedFromByte: number;
+}
+
+export interface HttpDownloadError {
+  ok: false;
+  error: string;
+  /** If true, the error is likely due to expired URL - should get fresh URL and retry */
+  urlExpired?: boolean;
+  /** If true, should delete partial file and start fresh */
+  startFresh?: boolean;
+  /** If true, download was aborted due to throttling detection */
+  throttled?: boolean;
+}
+
+/**
  * HTTP downloader interface for dependency injection.
  */
 export interface HttpDownloader {
@@ -160,44 +193,198 @@ export interface HttpDownloader {
     options?: {
       signal?: AbortSignal;
       rateLimit?: number;
+      /** If true, attempt to resume from existing partial file */
+      resume?: boolean;
       onProgress?: (downloaded: number, total: number | null) => void;
+      /** Throttle detection config (if not provided, throttle detection is disabled) */
+      throttleConfig?: {
+        /** Minimum speed in bytes/sec before considering throttled */
+        speedThreshold: number;
+        /** Seconds to measure rolling average */
+        detectionWindow: number;
+      };
     },
-  ): Promise<{ ok: true; size: number } | { ok: false; error: string }>;
+  ): Promise<HttpDownloadResult | HttpDownloadError>;
+}
+
+// ============================================================================
+// Speed Tracker for Throttle Detection
+// ============================================================================
+
+/**
+ * Tracks download speed using a rolling window of samples.
+ * Used to detect YouTube throttling.
+ */
+class SpeedTracker {
+  private samples: { time: number; bytes: number }[] = [];
+  private readonly windowMs: number;
+  private readonly threshold: number;
+
+  constructor(windowSeconds: number, thresholdBytesPerSec: number) {
+    this.windowMs = windowSeconds * 1000;
+    this.threshold = thresholdBytesPerSec;
+  }
+
+  /**
+   * Add a sample with the current cumulative bytes downloaded.
+   */
+  addSample(totalBytes: number): void {
+    const now = Date.now();
+    this.samples.push({ time: now, bytes: totalBytes });
+    
+    // Prune samples outside the window
+    const cutoff = now - this.windowMs;
+    this.samples = this.samples.filter(s => s.time >= cutoff);
+  }
+
+  /**
+   * Check if download is throttled based on rolling average speed.
+   * Only returns true if we have enough data (at least 90% of the window).
+   */
+  isThrottled(): boolean {
+    if (this.samples.length < 2) return false;
+    
+    const oldest = this.samples[0];
+    const newest = this.samples[this.samples.length - 1];
+    const elapsedMs = newest.time - oldest.time;
+    
+    // Only check if we have at least 90% of the detection window
+    if (elapsedMs < this.windowMs * 0.9) return false;
+    
+    const bytesDownloaded = newest.bytes - oldest.bytes;
+    const speedBytesPerSec = (bytesDownloaded / elapsedMs) * 1000;
+    
+    return speedBytesPerSec < this.threshold;
+  }
+
+  /**
+   * Get current rolling average speed in bytes/sec.
+   */
+  getCurrentSpeed(): number | null {
+    if (this.samples.length < 2) return null;
+    
+    const oldest = this.samples[0];
+    const newest = this.samples[this.samples.length - 1];
+    const elapsedMs = newest.time - oldest.time;
+    
+    if (elapsedMs === 0) return null;
+    
+    const bytesDownloaded = newest.bytes - oldest.bytes;
+    return (bytesDownloaded / elapsedMs) * 1000;
+  }
 }
 
 /**
  * Default HTTP downloader using fetch with streaming writes to disk.
  * Writes chunks directly to disk to avoid memory pressure from large files.
+ * Supports resuming interrupted downloads using HTTP Range requests.
  */
 export const defaultHttpDownloader: HttpDownloader = {
   async downloadToFile(url, outputPath, options) {
     let file: Deno.FsFile | null = null;
+    let startByte = 0;
+    let resumed = false;
 
     try {
-      const response = await fetch(url, { signal: options?.signal });
-      if (!response.ok) {
+      // Check for existing partial file if resume is requested
+      if (options?.resume) {
+        try {
+          const stat = await Deno.stat(outputPath);
+          startByte = stat.size;
+          if (startByte > 0) {
+            console.log(`[download] Found partial file: ${outputPath} (${startByte} bytes), attempting resume`);
+          }
+        } catch {
+          // File doesn't exist, start from beginning
+          startByte = 0;
+        }
+      }
+
+      // Build request headers
+      const headers: Record<string, string> = {};
+      if (startByte > 0) {
+        headers["Range"] = `bytes=${startByte}-`;
+      }
+
+      const response = await fetch(url, { 
+        signal: options?.signal,
+        headers,
+      });
+
+      // Handle different response codes
+      if (response.status === 416) {
+        // Range Not Satisfiable - file is likely complete or server doesn't support range
+        // Check if file already exists and return success
+        if (startByte > 0) {
+          console.log(`[download] Got 416, file appears complete at ${startByte} bytes`);
+          return { ok: true, size: startByte, resumed: true, resumedFromByte: startByte };
+        }
+        return { ok: false, error: "Range not satisfiable and no partial file exists", startFresh: true };
+      }
+
+      if (response.status === 403) {
+        // Forbidden - likely expired URL
+        return { ok: false, error: `HTTP 403: ${response.statusText}`, urlExpired: true };
+      }
+
+      if (!response.ok && response.status !== 206) {
         return { ok: false, error: `HTTP ${response.status}: ${response.statusText}` };
       }
 
+      // Check if server honored our Range request
+      if (startByte > 0 && response.status === 200) {
+        // Server ignored Range header, sent full content - must start over
+        console.log(`[download] Server ignored Range header, starting fresh`);
+        startByte = 0;
+        resumed = false;
+      } else if (response.status === 206) {
+        // Partial content - resuming successfully
+        resumed = true;
+        console.log(`[download] Resuming from byte ${startByte}`);
+      }
+
       const contentLength = response.headers.get("content-length");
-      const total = contentLength ? parseInt(contentLength, 10) : null;
+      const contentRange = response.headers.get("content-range");
+      
+      // Calculate total size
+      let total: number | null = null;
+      if (contentRange) {
+        // Format: "bytes 21010-47021/47022" or "bytes 21010-47021/*"
+        const match = contentRange.match(/bytes \d+-\d+\/(\d+|\*)/);
+        if (match && match[1] !== "*") {
+          total = parseInt(match[1], 10);
+        }
+      } else if (contentLength) {
+        total = startByte + parseInt(contentLength, 10);
+      }
 
       const reader = response.body?.getReader();
       if (!reader) {
         return { ok: false, error: "No response body" };
       }
 
-      // Open file for streaming writes
-      file = await Deno.open(outputPath, { write: true, create: true, truncate: true });
+      // Open file - append if resuming, truncate if starting fresh
+      if (startByte > 0 && resumed) {
+        file = await Deno.open(outputPath, { write: true, append: true });
+      } else {
+        file = await Deno.open(outputPath, { write: true, create: true, truncate: true });
+        startByte = 0;
+      }
 
-      let downloaded = 0;
+      let downloaded = startByte; // Start counting from resumed position
       let lastProgressTime = Date.now();
-      let lastDownloaded = 0;
+      let lastDownloaded = downloaded;
 
       // Rate limiting state
       const rateLimit = options?.rateLimit ?? 0;
       let rateLimitBucket = rateLimit;
       let lastRateLimitTime = Date.now();
+
+      // Throttle detection state
+      const speedTracker = options?.throttleConfig 
+        ? new SpeedTracker(options.throttleConfig.detectionWindow, options.throttleConfig.speedThreshold)
+        : null;
+      let lastThrottleCheckTime = Date.now();
 
       while (true) {
         const { done, value } = await reader.read();
@@ -214,15 +401,33 @@ export const defaultHttpDownloader: HttpDownloader = {
           rateLimitBucket = Math.min(rateLimit, rateLimitBucket + rateLimit * elapsed);
           lastRateLimitTime = now;
 
-          if (downloaded > rateLimitBucket) {
-            const delay = (downloaded - rateLimitBucket) / rateLimit * 1000;
+          // Rate limit based on bytes downloaded in this session (not including resumed bytes)
+          const sessionDownloaded = downloaded - startByte;
+          if (sessionDownloaded > rateLimitBucket) {
+            const delay = (sessionDownloaded - rateLimitBucket) / rateLimit * 1000;
             await new Promise((resolve) => setTimeout(resolve, delay));
-            rateLimitBucket = downloaded;
+            rateLimitBucket = sessionDownloaded;
+          }
+        }
+
+        // Throttle detection (check every second to avoid overhead)
+        const now = Date.now();
+        if (speedTracker && now - lastThrottleCheckTime >= 1000) {
+          speedTracker.addSample(downloaded);
+          lastThrottleCheckTime = now;
+          
+          if (speedTracker.isThrottled()) {
+            const speed = speedTracker.getCurrentSpeed();
+            const speedKBs = speed ? Math.round(speed / 1024) : 0;
+            console.log(`[download] Throttling detected: ${speedKBs} KB/s < ${Math.round(options!.throttleConfig!.speedThreshold / 1024)} KB/s threshold`);
+            // Close file before returning
+            file.close();
+            file = null;
+            return { ok: false, error: `Throttling detected (${speedKBs} KB/s)`, throttled: true };
           }
         }
 
         // Progress callback (throttled to every 100ms)
-        const now = Date.now();
         if (options?.onProgress && now - lastProgressTime > 100) {
           options.onProgress(downloaded, total);
           lastDownloaded = downloaded;
@@ -235,7 +440,7 @@ export const defaultHttpDownloader: HttpDownloader = {
         options.onProgress(downloaded, total);
       }
 
-      return { ok: true, size: downloaded };
+      return { ok: true, size: downloaded, resumed, resumedFromByte: startByte };
     } catch (error) {
       if (error instanceof Error && error.name === "AbortError") {
         return { ok: false, error: "Download cancelled" };
@@ -255,9 +460,27 @@ export const defaultHttpDownloader: HttpDownloader = {
 };
 
 /**
+ * Result type for downloadAudioSynced.
+ */
+interface AudioDownloadResult {
+  ok: true;
+  size: number;
+  resumed: boolean;
+  resumedFromByte: number;
+}
+
+interface AudioDownloadError {
+  ok: false;
+  error: string;
+  urlExpired?: boolean;
+  startFresh?: boolean;
+}
+
+/**
  * Download audio synced to video progress.
  * Throttles audio download to stay at or slightly behind video percentage.
  * This ensures both streams finish around the same time.
+ * Supports resuming interrupted downloads using HTTP Range requests.
  */
 async function downloadAudioSynced(
   url: string,
@@ -266,43 +489,129 @@ async function downloadAudioSynced(
   options: {
     signal?: AbortSignal;
     getVideoPercentage: () => number; // Returns current video download percentage (0-1)
+    /** If true, attempt to resume from existing partial file */
+    resume?: boolean;
+    /** If resuming, the video's resumed percentage (0-1) - audio can catch up faster */
+    videoResumedPercentage?: number;
     onProgress?: (downloaded: number, total: number | null) => void;
   },
-): Promise<{ ok: true; size: number } | { ok: false; error: string }> {
+): Promise<AudioDownloadResult | AudioDownloadError> {
   let file: Deno.FsFile | null = null;
   const LEAD_BUFFER = 0.02; // Allow audio to lead by up to 2%
+  let startByte = 0;
+  let resumed = false;
 
   try {
-    const response = await fetch(url, { signal: options.signal });
-    if (!response.ok) {
+    // Check for existing partial file if resume is requested
+    if (options.resume) {
+      try {
+        const stat = await Deno.stat(outputPath);
+        startByte = stat.size;
+        if (startByte > 0) {
+          console.log(`[download] Found partial audio file: ${outputPath} (${startByte} bytes), attempting resume`);
+        }
+      } catch {
+        // File doesn't exist, start from beginning
+        startByte = 0;
+      }
+    }
+
+    // Build request headers
+    const headers: Record<string, string> = {};
+    if (startByte > 0) {
+      headers["Range"] = `bytes=${startByte}-`;
+    }
+
+    const response = await fetch(url, { signal: options.signal, headers });
+
+    // Handle different response codes
+    if (response.status === 416) {
+      // Range Not Satisfiable - file is likely complete
+      if (startByte > 0) {
+        console.log(`[download] Got 416 for audio, file appears complete at ${startByte} bytes`);
+        return { ok: true, size: startByte, resumed: true, resumedFromByte: startByte };
+      }
+      return { ok: false, error: "Range not satisfiable and no partial file exists", startFresh: true };
+    }
+
+    if (response.status === 403) {
+      // Forbidden - likely expired URL
+      return { ok: false, error: `HTTP 403: ${response.statusText}`, urlExpired: true };
+    }
+
+    if (!response.ok && response.status !== 206) {
       return { ok: false, error: `HTTP ${response.status}: ${response.statusText}` };
     }
 
+    // Check if server honored our Range request
+    if (startByte > 0 && response.status === 200) {
+      // Server ignored Range header, sent full content - must start over
+      console.log(`[download] Server ignored Range header for audio, starting fresh`);
+      startByte = 0;
+      resumed = false;
+    } else if (response.status === 206) {
+      // Partial content - resuming successfully
+      resumed = true;
+      console.log(`[download] Resuming audio from byte ${startByte}`);
+    }
+
+    // Calculate total size
     const contentLength = response.headers.get("content-length");
-    const total = contentLength ? parseInt(contentLength, 10) : audioTotalBytes;
+    const contentRange = response.headers.get("content-range");
+    
+    let total: number | null = null;
+    if (contentRange) {
+      // Format: "bytes 21010-47021/47022" or "bytes 21010-47021/*"
+      const match = contentRange.match(/bytes \d+-\d+\/(\d+|\*)/);
+      if (match && match[1] !== "*") {
+        total = parseInt(match[1], 10);
+      }
+    } else if (contentLength) {
+      total = startByte + parseInt(contentLength, 10);
+    } else {
+      total = audioTotalBytes;
+    }
 
     const reader = response.body?.getReader();
     if (!reader) {
       return { ok: false, error: "No response body" };
     }
 
-    file = await Deno.open(outputPath, { write: true, create: true, truncate: true });
-    let downloaded = 0;
+    // Open file - append if resuming, truncate if starting fresh
+    if (startByte > 0 && resumed) {
+      file = await Deno.open(outputPath, { write: true, append: true });
+    } else {
+      file = await Deno.open(outputPath, { write: true, create: true, truncate: true });
+      startByte = 0;
+    }
+
+    let downloaded = startByte; // Start counting from resumed position
     let lastProgressTime = Date.now();
+
+    // Calculate audio's resumed percentage (for throttling logic)
+    const audioResumedPercentage = total && startByte > 0 ? startByte / total : 0;
+    const videoResumedPercentage = options.videoResumedPercentage ?? 0;
 
     while (true) {
       // Check if we need to throttle (audio ahead of video)
+      // But if audio was resumed ahead of video, let it run at full speed until video catches up
       if (total && total > 0) {
         const audioPercentage = downloaded / total;
         let videoPercentage = options.getVideoPercentage();
 
-        // If audio is ahead of video + buffer, wait for video to catch up
-        while (audioPercentage > videoPercentage + LEAD_BUFFER && videoPercentage < 1) {
+        // Only throttle if audio would get ahead of where it started OR ahead of video + buffer
+        // This allows audio to catch up if it was behind after resume
+        const shouldThrottle = audioPercentage > audioResumedPercentage && 
+                               audioPercentage > videoPercentage + LEAD_BUFFER;
+
+        while (shouldThrottle && videoPercentage < 1) {
           if (options.signal?.aborted) {
             return { ok: false, error: "Download cancelled" };
           }
           await new Promise((resolve) => setTimeout(resolve, 100));
           videoPercentage = options.getVideoPercentage();
+          // Re-check throttle condition
+          if (!(audioPercentage > videoPercentage + LEAD_BUFFER)) break;
         }
       }
 
@@ -329,7 +638,7 @@ async function downloadAudioSynced(
       options.onProgress(downloaded, total);
     }
 
-    return { ok: true, size: downloaded };
+    return { ok: true, size: downloaded, resumed, resumedFromByte: startByte };
   } catch (error) {
     if (error instanceof Error && error.name === "AbortError") {
       return { ok: false, error: "Download cancelled" };
@@ -440,7 +749,7 @@ export function createDownloadManager(
    * Download a single video.
    */
   async function downloadVideo(options: DownloadOptions): Promise<DownloadResult> {
-    const { videoInfo, streams, outputDir, rateLimit = config.rateLimit } = options;
+    const { videoInfo, streams, outputDir, rateLimit = config.rateLimit, resume = false, throttleConfig } = options;
     const onProgress = options.onProgress ?? (() => {});
 
     // Check we have streams to download
@@ -546,20 +855,23 @@ export function createDownloadManager(
 
         // Download both streams in parallel
         const [videoResult, audioResult] = await Promise.all([
-          // Video: uses configured rate limit
+          // Video: uses configured rate limit, with resume support and throttle detection
           downloader.downloadToFile(streams.video.url, paths.videoPath, {
             signal: abortController.signal,
             rateLimit,
+            resume,
+            throttleConfig, // Only video stream gets throttle detection (audio is synced)
             onProgress: (downloaded, total) => {
               videoDownloaded = downloaded;
               if (total) videoTotal = total;
               reportProgress();
             },
           }),
-          // Audio: synced to video progress (stays slightly behind or equal)
+          // Audio: synced to video progress (stays slightly behind or equal), with resume support
           downloadAudioSynced(streams.audio.url, paths.audioPath, audioTotal, {
             signal: abortController.signal,
             getVideoPercentage,
+            resume,
             onProgress: (downloaded, total) => {
               audioDownloaded = downloaded;
               if (total) audioTotal = total;
@@ -568,17 +880,68 @@ export function createDownloadManager(
           }),
         ]);
 
-        // Handle errors - if either failed, clean up both
+        // Handle errors - check for special error types
         if (!videoResult.ok || !audioResult.ok) {
+          // Check for URL expired errors - don't clean up tmp files, signal to retry with fresh URLs
+          const videoError = !videoResult.ok ? videoResult as HttpDownloadError : null;
+          const audioError = !audioResult.ok ? audioResult as AudioDownloadError : null;
+          
+          // Check for throttling first (video stream only)
+          if (videoError?.throttled) {
+            // Don't delete tmp files - they can be resumed with fresh URLs
+            return {
+              ok: false,
+              error: { 
+                type: "download_failed", 
+                message: videoError.error,
+                cause: { throttled: true },
+              },
+            };
+          }
+          
+          if (videoError?.urlExpired || audioError?.urlExpired) {
+            // Don't delete tmp files - they can be resumed with fresh URLs
+            return {
+              ok: false,
+              error: { 
+                type: "download_failed", 
+                message: "Stream URL expired - retry with fresh URLs",
+                cause: { urlExpired: true },
+              },
+            };
+          }
+          
+          if (videoError?.startFresh || audioError?.startFresh) {
+            // Server doesn't support resume - delete tmp files and signal to retry fresh
+            await fs.remove(paths.videoPath).catch(() => {});
+            await fs.remove(paths.audioPath).catch(() => {});
+            return {
+              ok: false,
+              error: { 
+                type: "download_failed", 
+                message: "Server doesn't support resume - retry from start",
+                cause: { startFresh: true },
+              },
+            };
+          }
+          
+          // Regular error - clean up and report
           await fs.remove(paths.videoPath).catch(() => {});
           await fs.remove(paths.audioPath).catch(() => {});
           const errorMsg = !videoResult.ok
-            ? `Video download failed: ${(videoResult as { ok: false; error: string }).error}`
-            : `Audio download failed: ${(audioResult as { ok: false; error: string }).error}`;
+            ? `Video download failed: ${videoError?.error}`
+            : `Audio download failed: ${audioError?.error}`;
           return {
             ok: false,
             error: { type: "download_failed", message: errorMsg },
           };
+        }
+
+        // Log if we resumed
+        if ((videoResult as HttpDownloadResult).resumed || (audioResult as AudioDownloadResult).resumed) {
+          const vResumed = (videoResult as HttpDownloadResult).resumed;
+          const aResumed = (audioResult as AudioDownloadResult).resumed;
+          console.log(`[download] ${videoInfo.videoId}: Completed with resume (video: ${vResumed}, audio: ${aResumed})`);
         }
 
         // Move temp streams to itag-based paths for DASH streaming (no auto-muxing)
@@ -658,6 +1021,7 @@ export function createDownloadManager(
           {
             signal: abortController.signal,
             rateLimit,
+            resume,
             onProgress: (downloaded, total) => {
               // Calculate speed
               const now = Date.now();
@@ -685,9 +1049,21 @@ export function createDownloadManager(
         );
 
         if (!result.ok) {
+          const combinedError = result as HttpDownloadError;
+          // Check for URL expired - don't clean up, can retry
+          if (combinedError.urlExpired) {
+            return {
+              ok: false,
+              error: { 
+                type: "download_failed", 
+                message: "Stream URL expired - retry with fresh URLs",
+                cause: { urlExpired: true },
+              },
+            };
+          }
           return {
             ok: false,
-            error: { type: "download_failed", message: `Download failed: ${result.error}` },
+            error: { type: "download_failed", message: `Download failed: ${combinedError.error}` },
           };
         }
 
@@ -731,11 +1107,16 @@ export function createDownloadManager(
         audioExtension: paths.audioExtension,
       };
     } catch (error) {
-      // Clean up any temp files
-      await fs.remove(paths.videoPath).catch(() => {});
-      await fs.remove(paths.audioPath).catch(() => {});
+      // Only clean up temp files if not cancelled (cancelled = user wants to keep progress)
+      // and not a resumable error
+      const isCancelled = error instanceof Error && error.name === "AbortError";
+      if (!isCancelled && !resume) {
+        // If not resuming, clean up temp files on any error
+        await fs.remove(paths.videoPath).catch(() => {});
+        await fs.remove(paths.audioPath).catch(() => {});
+      }
 
-      if (error instanceof Error && error.name === "AbortError") {
+      if (isCancelled) {
         return {
           ok: false,
           error: { type: "cancelled", message: "Download was cancelled" },

@@ -208,4 +208,107 @@ describe("defaultHttpDownloader", { sanitizeOps: false, sanitizeResources: false
     const content = await Deno.readTextFile(outputPath);
     assertEquals(content, "test");
   });
+
+  // ==========================================================================
+  // Resume Download Tests
+  // ==========================================================================
+
+  it("should resume download from existing partial file", async () => {
+    await Deno.mkdir(testDir, { recursive: true });
+    const outputPath = `${testDir}/test-resume.bin`;
+    testFiles.push(outputPath);
+
+    // First download - get 512 bytes
+    const firstResult = await defaultHttpDownloader.downloadToFile(
+      "https://httpbin.org/bytes/512",
+      outputPath,
+    );
+    assertEquals(firstResult.ok, true);
+    if (firstResult.ok) {
+      assertEquals(firstResult.size, 512);
+      assertEquals(firstResult.resumed, false);
+      assertEquals(firstResult.resumedFromByte, 0);
+    }
+
+    // Now try to resume (the file is already complete, so server should return 416)
+    const resumeResult = await defaultHttpDownloader.downloadToFile(
+      "https://httpbin.org/bytes/512",
+      outputPath,
+      { resume: true },
+    );
+
+    // httpbin doesn't support Range requests, so it will return 200 (start fresh)
+    // This tests the "server ignored Range header" code path
+    assertEquals(resumeResult.ok, true);
+    if (resumeResult.ok) {
+      // Server returned 200 (full content), so we start fresh
+      assertEquals(resumeResult.resumed, false);
+    }
+  });
+
+  it("should handle resume when file does not exist", async () => {
+    await Deno.mkdir(testDir, { recursive: true });
+    const outputPath = `${testDir}/test-resume-new.bin`;
+    testFiles.push(outputPath);
+
+    // File doesn't exist, resume should behave like fresh download
+    const result = await defaultHttpDownloader.downloadToFile(
+      "https://httpbin.org/bytes/256",
+      outputPath,
+      { resume: true },
+    );
+
+    assertEquals(result.ok, true);
+    if (result.ok) {
+      assertEquals(result.size, 256);
+      assertEquals(result.resumed, false);
+      assertEquals(result.resumedFromByte, 0);
+    }
+  });
+
+  it("should detect partial file size for resume", async () => {
+    await Deno.mkdir(testDir, { recursive: true });
+    const outputPath = `${testDir}/test-partial-detect.bin`;
+    testFiles.push(outputPath);
+
+    // Create a partial file
+    const partialData = new Uint8Array(100);
+    await Deno.writeFile(outputPath, partialData);
+
+    // Verify partial file exists
+    const stat = await Deno.stat(outputPath);
+    assertEquals(stat.size, 100);
+
+    // When resuming, the downloader should detect the existing file
+    // Note: httpbin doesn't support Range, so this tests the detection logic
+    const result = await defaultHttpDownloader.downloadToFile(
+      "https://httpbin.org/bytes/1024",
+      outputPath,
+      { resume: true },
+    );
+
+    assertEquals(result.ok, true);
+    // Since httpbin returns 200 (ignores Range), resumed should be false
+    // The file should be overwritten with fresh content
+    if (result.ok) {
+      assertEquals(result.resumed, false);
+    }
+  });
+
+  it("should return urlExpired flag on 403 response", async () => {
+    await Deno.mkdir(testDir, { recursive: true });
+    const outputPath = `${testDir}/test-403.bin`;
+    testFiles.push(outputPath);
+
+    const result = await defaultHttpDownloader.downloadToFile(
+      "https://httpbin.org/status/403",
+      outputPath,
+    );
+
+    assertEquals(result.ok, false);
+    if (!result.ok) {
+      assertEquals(result.urlExpired, true);
+      assertEquals(result.error.includes("403"), true);
+    }
+  });
 });

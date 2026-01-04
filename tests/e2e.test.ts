@@ -49,6 +49,12 @@ function createTestConfig(overrides: Partial<Config> = {}): Config {
     maxConcurrentDownloads: 2,
     maxRetryAttempts: 3,
     retryBaseDelayMinutes: 1,
+    cleanupEnabled: false,
+    cleanupDays: 14,
+    cleanupIntervalHours: 24,
+    throttleSpeedThreshold: 102400,
+    throttleDetectionWindow: 30,
+    throttleMaxRetries: 5,
     ...overrides,
   };
 }

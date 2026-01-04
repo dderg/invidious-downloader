@@ -323,6 +323,10 @@ describe("createSubscriptionWatcher", () => {
       getChannels: async () => ({ ok: true, data: [] }),
       getLatestVideos: async () => ({ ok: true, data: [] }),
       getMaxPublishedTimestamp: async () => ({ ok: true, data: null }),
+      getUsersSubscribedToChannel: async () => ({ ok: true, data: [] }),
+      getUserBySessionId: async () => ({ ok: true, data: null }),
+      hasUserWatchedVideo: async () => ({ ok: true, data: false }),
+      getWatchedVideoIds: async () => ({ ok: true, data: [] }),
       close: async () => {},
       ...overrides,
     };
@@ -341,7 +345,7 @@ describe("createSubscriptionWatcher", () => {
       getDownloads: () => ({ ok: true, data: [] }),
       deleteDownload: () => ({ ok: true, data: true }),
       getDownloadStats: () => ({ ok: true, data: { count: 0, totalBytes: 0 } }),
-      addToQueue: () => ({ ok: true, data: { id: 1, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null, retryCount: 0, nextRetryAt: null } }),
+      addToQueue: () => ({ ok: true, data: { id: 1, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null, retryCount: 0, nextRetryAt: null, source: "manual", throttleRetryCount: 0 } }),
       getQueue: () => ({ ok: true, data: [] }),
       getNextQueueItem: () => ({ ok: true, data: null }),
       updateQueueStatus: () => ({ ok: true, data: {} }),
@@ -428,7 +432,7 @@ describe("createSubscriptionWatcher", () => {
         localDb: createMockLocalDb({
           addToQueue: () => {
             queuedCount++;
-            return { ok: true, data: { id: queuedCount, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null, retryCount: 0, nextRetryAt: null } };
+            return { ok: true, data: { id: queuedCount, videoId: "", userId: null, priority: 0, status: "pending", errorMessage: null, queuedAt: new Date(), startedAt: null, completedAt: null, retryCount: 0, nextRetryAt: null, source: "manual", throttleRetryCount: 0 } };
           },
         }),
       });

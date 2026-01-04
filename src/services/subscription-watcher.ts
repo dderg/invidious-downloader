@@ -401,9 +401,15 @@ export function createSubscriptionWatcher(
       // 7. Add to queue
       let queued = 0;
       for (const video of toQueue) {
+        // Get users subscribed to this channel for per-user ownership
+        const subscribersResult = await deps.invidiousDb.getUsersSubscribedToChannel(video.ucid);
+        const ownerUserIds = subscribersResult.ok ? subscribersResult.data : [];
+        
         const result = deps.localDb.addToQueue({
           videoId: video.id,
           userId: fullConfig.userId,
+          source: "subscription",
+          ownerUserIds,
         });
         if (result.ok) {
           queued++;

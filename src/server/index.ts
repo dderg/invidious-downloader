@@ -11,9 +11,11 @@
 import { Hono, type Context } from "@hono/hono";
 import { logger } from "@hono/hono/logger";
 import { cors } from "@hono/hono/cors";
+import { getCookie } from "@hono/hono/cookie";
 
 import type { Config } from "../config.ts";
 import type { LocalDbClient } from "../db/local-db.ts";
+import type { InvidiousDbClient } from "../db/invidious-db.ts";
 import type { DownloadManager } from "../services/download-manager.ts";
 import type { Muxer } from "../services/muxer.ts";
 
@@ -154,6 +156,7 @@ async function transformVideoApiResponse(
 export interface ServerDependencies {
   config: Config;
   db: LocalDbClient;
+  invidiousDb?: InvidiousDbClient;
   downloadManager?: DownloadManager;
   muxer?: Muxer;
   /** Optional custom HTTP fetcher for proxy */
@@ -179,10 +182,40 @@ export interface Server {
 // ============================================================================
 
 /**
+ * Get current user from Invidious session cookie.
+ * Returns user email if logged in, null otherwise.
+ */
+async function getCurrentUser(
+  c: Context,
+  invidiousDb?: InvidiousDbClient,
+): Promise<string | null> {
+  if (!invidiousDb) {
+    console.log("[auth] No invidiousDb configured");
+    return null;
+  }
+  
+  const sessionId = getCookie(c, "SID");
+  if (!sessionId) {
+    console.log("[auth] No SID cookie found in request");
+    return null;
+  }
+  
+  console.log("[auth] Found SID cookie, looking up user...");
+  const result = await invidiousDb.getUserBySessionId(sessionId);
+  if (!result.ok || !result.data) {
+    console.log("[auth] Session lookup failed or expired");
+    return null;
+  }
+  
+  console.log(`[auth] Authenticated user: ${result.data}`);
+  return result.data;
+}
+
+/**
  * Create the HTTP server.
  */
 export function createServer(deps: ServerDependencies): Server {
-  const { config, db, downloadManager, muxer, httpFetcher, videoFileSystem } = deps;
+  const { config, db, invidiousDb, downloadManager, muxer, httpFetcher, videoFileSystem } = deps;
 
   // Create components
   const proxy = createProxy(
@@ -213,7 +246,7 @@ export function createServer(deps: ServerDependencies): Server {
   // API Routes
   // ==========================================================================
 
-  const apiRouter = createApiRouter({ db, downloadManager, muxer, videosPath: config.videosPath });
+  const apiRouter = createApiRouter({ db, invidiousDb, downloadManager, muxer, videosPath: config.videosPath });
   app.route("/api/downloader", apiRouter);
 
   // ==========================================================================
@@ -242,9 +275,9 @@ export function createServer(deps: ServerDependencies): Server {
     // Get HTML content
     let html = await response.text();
 
-    // Check if video ID is valid and cached
+    // Check if video ID is valid and has cached streams
     const isValidVideoId = videoId && /^[a-zA-Z0-9_-]{11}$/.test(videoId);
-    const isCached = isValidVideoId ? await videoHandler.isCached(videoId) : false;
+    const hasCached = isValidVideoId ? await videoHandler.hasCachedStreams(videoId) : false;
 
     // Build download status for injection
     let downloadStatus: DownloadStatus | null = null;
@@ -266,7 +299,7 @@ export function createServer(deps: ServerDependencies): Server {
       }
     }
 
-    if (isCached && videoId) {
+    if (hasCached && videoId) {
       console.log(`[watch] Video ${videoId} is cached, using DASH streaming from local cache`);
       // No HTML modification needed - the /api/v1/videos/:videoId endpoint
       // will return adaptiveFormats with local URLs, and /videoplayback
@@ -302,15 +335,15 @@ export function createServer(deps: ServerDependencies): Server {
       return proxy.proxy(c.req.raw);
     }
 
-    // Check if video is cached
-    const isCached = await videoHandler.isCached(videoId);
+    // Check if video has cached streams (muxed MP4 or DASH streams)
+    const hasCached = await videoHandler.hasCachedStreams(videoId);
 
-    if (!isCached) {
+    if (!hasCached) {
       // Not cached, proxy normally
       return proxy.proxy(c.req.raw);
     }
 
-    console.log(`[api] Video ${videoId} is cached, modifying API response`);
+    console.log(`[api] Video ${videoId} has cached streams, modifying API response`);
 
     // Proxy to get original response
     const proxyResult = await proxy.proxyRequest({ request: c.req.raw });
@@ -384,13 +417,12 @@ export function createServer(deps: ServerDependencies): Server {
       return proxy.proxy(c.req.raw);
     }
 
-    // Check if video is cached with DASH streams
-    const isCached = await videoHandler.isCached(videoId);
+    // Check if video has cached DASH streams
     const cachedStreams = await videoHandler.getCachedStreams(videoId);
     const hasAdaptiveStreams = cachedStreams.videoItags.length > 0 && cachedStreams.audioItags.length > 0;
 
-    if (!isCached || !hasAdaptiveStreams) {
-      console.log(`[dash-manifest] Video ${videoId} not cached or no DASH streams, proxying to Companion`);
+    if (!hasAdaptiveStreams) {
+      console.log(`[dash-manifest] Video ${videoId} has no cached DASH streams, proxying to Companion`);
       return proxy.proxy(c.req.raw);
     }
 
@@ -460,9 +492,10 @@ export function createServer(deps: ServerDependencies): Server {
       console.error(`[dash-manifest] Failed to parse audio stream ${audioStreamPath}: ${audioRangesResult.error}`);
     }
 
-    // Generate DASH manifest XML with real byte ranges
+    // Generate DASH manifest XML
+    // We provide indexRange for seeking support.
     const manifest = `<?xml version="1.0" encoding="UTF-8"?>
-<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="${durationISO}" minBufferTime="PT1.5S">
+<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" mediaPresentationDuration="${durationISO}" minBufferTime="PT30S">
   <Period duration="${durationISO}">
     <AdaptationSet mimeType="video/mp4" contentType="video" subsegmentAlignment="true" subsegmentStartsWithSAP="1">
       <Representation id="${videoItag}" bandwidth="${metadata?.videoBitrate || 5000000}" codecs="${videoCodec}" width="${width}" height="${height}">
@@ -498,12 +531,13 @@ export function createServer(deps: ServerDependencies): Server {
   // ==========================================================================
 
   // Handle videoplayback requests - intercept by itag for DASH streaming
-  app.all("/videoplayback*", async (c: Context) => {
+  app.all("/videoplayback", async (c: Context) => {
+    console.log(`[videoplayback] HANDLER INVOKED for ${c.req.url}`);
     const url = new URL(c.req.url);
     const videoId = extractVideoIdFromPath(url.pathname, url.search.slice(1));
     const itag = url.searchParams.get("itag");
 
-    console.log(`[videoplayback] Request for video: ${videoId}, itag: ${itag}`);
+    console.log(`[videoplayback] Request: ${url.pathname}${url.search}, videoId: ${videoId}, itag: ${itag}`);
 
     // If we have a video ID and itag, try to serve the specific stream
     if (videoId && itag) {
@@ -511,21 +545,29 @@ export function createServer(deps: ServerDependencies): Server {
       const rangeHeader = c.req.header("Range") ?? null;
 
       // Try video stream first
-      if (await videoHandler.hasVideoStream(videoId, itagNum)) {
+      const hasVideo = await videoHandler.hasVideoStream(videoId, itagNum);
+      console.log(`[videoplayback] hasVideoStream(${videoId}, ${itagNum}) = ${hasVideo}`);
+      
+      if (hasVideo) {
         console.log(`[videoplayback] Serving cached video stream: ${videoId} itag ${itagNum}`);
         const result = await videoHandler.serveVideoStream(videoId, itagNum, rangeHeader);
         if (result.ok) {
           return result.response;
         }
+        console.log(`[videoplayback] serveVideoStream failed:`, result.error);
       }
 
       // Try audio stream
-      if (await videoHandler.hasAudioStream(videoId, itagNum)) {
+      const hasAudio = await videoHandler.hasAudioStream(videoId, itagNum);
+      console.log(`[videoplayback] hasAudioStream(${videoId}, ${itagNum}) = ${hasAudio}`);
+      
+      if (hasAudio) {
         console.log(`[videoplayback] Serving cached audio stream: ${videoId} itag ${itagNum}`);
         const result = await videoHandler.serveAudioStream(videoId, itagNum, rangeHeader);
         if (result.ok) {
           return result.response;
         }
+        console.log(`[videoplayback] serveAudioStream failed:`, result.error);
       }
     }
 
@@ -612,7 +654,9 @@ export function createServer(deps: ServerDependencies): Server {
   });
 
   app.get("/downloader/", async (c: Context) => {
-    const html = await generateDashboardHtml({ db, downloadManager });
+    const userId = await getCurrentUser(c, invidiousDb);
+    console.log(`[dashboard] Rendering dashboard for user: ${userId ?? "NOT LOGGED IN"}`);
+    const html = await generateDashboardHtml({ db, downloadManager, userId });
     return c.html(html);
   });
 

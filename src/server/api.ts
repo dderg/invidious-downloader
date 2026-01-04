@@ -17,7 +17,9 @@
  */
 
 import { Hono, type Context } from "@hono/hono";
+import { getCookie } from "@hono/hono/cookie";
 import type { LocalDbClient } from "../db/local-db.ts";
+import type { InvidiousDbClient } from "../db/invidious-db.ts";
 import type { DownloadManager } from "../services/download-manager.ts";
 import type { Muxer } from "../services/muxer.ts";
 import type { QueueStatus, Download } from "../db/types.ts";
@@ -33,6 +35,7 @@ import { getAudioExtension } from "../services/download-manager.ts";
  */
 export interface ApiDependencies {
   db: LocalDbClient;
+  invidiousDb?: InvidiousDbClient;
   downloadManager?: DownloadManager;
   muxer?: Muxer;
   videosPath?: string;
@@ -95,10 +98,36 @@ async function checkMuxedFileExists(filePath: string): Promise<boolean> {
  * Create the API router.
  */
 export function createApiRouter(deps: ApiDependencies) {
-  const { db, downloadManager, muxer, videosPath } = deps;
+  const { db, invidiousDb, downloadManager, muxer, videosPath } = deps;
   const startTime = Date.now();
 
   const api = new Hono();
+
+  /**
+   * Get current user from Invidious session cookie.
+   */
+  async function getCurrentUser(c: Context): Promise<string | null> {
+    if (!invidiousDb) {
+      console.log("[api/auth] No invidiousDb configured");
+      return null;
+    }
+    
+    const sessionId = getCookie(c, "SID");
+    if (!sessionId) {
+      console.log("[api/auth] No SID cookie found");
+      return null;
+    }
+    
+    console.log("[api/auth] Found SID cookie, looking up user...");
+    const result = await invidiousDb.getUserBySessionId(sessionId);
+    if (!result.ok || !result.data) {
+      console.log("[api/auth] Session lookup failed or no user:", result.ok ? "no user" : result.error);
+      return null;
+    }
+    
+    console.log(`[api/auth] Authenticated user: ${result.data}`);
+    return result.data;
+  }
 
   // ==========================================================================
   // Status
@@ -129,6 +158,12 @@ export function createApiRouter(deps: ApiDependencies) {
   // ==========================================================================
 
   api.get("/queue", async (c: Context) => {
+    const userId = await getCurrentUser(c);
+    
+    if (!userId) {
+      return c.json({ error: "Login required" }, 401);
+    }
+
     const statusParam = c.req.query("status");
     const limitParam = c.req.query("limit");
     const offsetParam = c.req.query("offset");
@@ -145,7 +180,8 @@ export function createApiRouter(deps: ApiDependencies) {
       options.offset = parseInt(offsetParam, 10);
     }
 
-    const result = db.getQueue(options);
+    // Get user's queue only
+    const result = db.getUserQueue(userId, options);
 
     if (!result.ok) {
       return c.json({ error: result.error.message }, 500);
@@ -242,13 +278,67 @@ export function createApiRouter(deps: ApiDependencies) {
     return c.json({ success: true, item: updateResult.data });
   });
 
+  // Retry a queue item (for failed, cancelled, or stuck downloading items)
+  api.post("/queue/:videoId/retry", async (c: Context) => {
+    const videoId = c.req.param("videoId");
+    const fresh = c.req.query("fresh") === "true";
+
+    // Get current queue item
+    const queueItem = db.getQueueItem(videoId);
+    if (!queueItem.ok) {
+      return c.json({ error: queueItem.error.message }, 500);
+    }
+
+    if (!queueItem.data) {
+      return c.json({ error: "Video not found in queue" }, 404);
+    }
+
+    const status = queueItem.data.status;
+
+    // Only allow retry for failed, cancelled, or downloading items
+    if (!["failed", "cancelled", "downloading"].includes(status)) {
+      return c.json({ 
+        error: `Cannot retry item with status '${status}'. Only failed, cancelled, or stuck downloading items can be retried.` 
+      }, 400);
+    }
+
+    // If fresh=true, delete any partial download files
+    if (fresh && videosPath) {
+      const videoTmpPath = `${videosPath}/${videoId}_video.tmp`;
+      const audioTmpPath = `${videosPath}/${videoId}_audio.tmp`;
+
+      try { await Deno.remove(videoTmpPath); } catch { /* ignore */ }
+      try { await Deno.remove(audioTmpPath); } catch { /* ignore */ }
+      
+      console.log(`[api] Deleted partial files for ${videoId} (fresh retry requested)`);
+    }
+
+    // Reset the item to pending with cleared retry count
+    const resetResult = db.resetRetryCount(videoId);
+    if (!resetResult.ok) {
+      return c.json({ error: resetResult.error.message }, 500);
+    }
+
+    return c.json({ 
+      success: true, 
+      item: resetResult.data,
+      fresh,
+      message: fresh ? "Retry started (partial files deleted)" : "Retry started (will resume if possible)",
+    });
+  });
+
   // ==========================================================================
   // Downloads
   // ==========================================================================
 
   api.get("/downloads", async (c: Context) => {
+    const userId = await getCurrentUser(c);
+    
+    if (!userId) {
+      return c.json({ error: "Login required" }, 401);
+    }
+
     const channelId = c.req.query("channelId");
-    const userId = c.req.query("userId");
     const limitParam = c.req.query("limit");
     const offsetParam = c.req.query("offset");
     const pageParam = c.req.query("page");
@@ -259,6 +349,7 @@ export function createApiRouter(deps: ApiDependencies) {
     const page = pageParam ? parseInt(pageParam, 10) : 1;
     const offset = offsetParam ? parseInt(offsetParam, 10) : (page - 1) * limit;
 
+    // Always filter by current user for privacy
     const result = db.getDownloads({
       channelId,
       userId,
@@ -272,7 +363,7 @@ export function createApiRouter(deps: ApiDependencies) {
       return c.json({ error: result.error.message }, 500);
     }
 
-    // Get total count for pagination
+    // Get total count for pagination (filtered by user)
     const countResult = db.getDownloadsCount({ channelId, userId });
     const total = countResult.ok ? countResult.data : result.data.length;
 
@@ -291,6 +382,11 @@ export function createApiRouter(deps: ApiDependencies) {
 
   api.get("/downloads/:videoId", async (c: Context) => {
     const videoId = c.req.param("videoId");
+    const userId = await getCurrentUser(c);
+
+    if (!userId) {
+      return c.json({ error: "Login required" }, 401);
+    }
 
     const result = db.getDownload(videoId);
 
@@ -302,11 +398,22 @@ export function createApiRouter(deps: ApiDependencies) {
       return c.json({ error: "Download not found" }, 404);
     }
 
+    // Check if user owns this video
+    const statusResult = db.getVideoUserStatus(videoId, userId);
+    if (!statusResult.ok || !statusResult.data?.isOwner) {
+      return c.json({ error: "Download not found" }, 404);
+    }
+
     return c.json(result.data);
   });
 
   api.delete("/downloads/:videoId", async (c: Context) => {
     const videoId = c.req.param("videoId");
+    const userId = await getCurrentUser(c);
+
+    if (!userId) {
+      return c.json({ error: "Login required" }, 401);
+    }
 
     // Get download info first
     const downloadResult = db.getDownload(videoId);
@@ -315,6 +422,12 @@ export function createApiRouter(deps: ApiDependencies) {
     }
 
     if (!downloadResult.data) {
+      return c.json({ error: "Download not found" }, 404);
+    }
+
+    // Check if user owns this video
+    const statusResult = db.getVideoUserStatus(videoId, userId);
+    if (!statusResult.ok || !statusResult.data?.isOwner) {
       return c.json({ error: "Download not found" }, 404);
     }
 
@@ -481,6 +594,88 @@ export function createApiRouter(deps: ApiDependencies) {
     });
   });
 
+  // Set keep_forever flag for a video (prevents auto-deletion)
+  api.post("/downloads/:videoId/keep", async (c: Context) => {
+    const videoId = c.req.param("videoId");
+    const userId = await getCurrentUser(c);
+
+    if (!userId) {
+      return c.json({ error: "Login required" }, 401);
+    }
+
+    // Parse body for keep flag (default true)
+    let keep = true;
+    try {
+      const body = await c.req.json();
+      if (typeof body.keep === "boolean") {
+        keep = body.keep;
+      }
+    } catch {
+      // No body or invalid JSON - use default (keep = true)
+    }
+
+    // Check if user owns this video
+    const statusResult = db.getVideoUserStatus(videoId, userId);
+    if (!statusResult.ok) {
+      return c.json({ error: statusResult.error.message }, 500);
+    }
+
+    if (!statusResult.data || !statusResult.data.isOwner) {
+      return c.json({ error: "Video not in your library" }, 404);
+    }
+
+    // Update keep_forever flag
+    const updateResult = db.setKeepForever(videoId, userId, keep);
+    if (!updateResult.ok) {
+      return c.json({ error: updateResult.error.message }, 500);
+    }
+
+    return c.json({
+      success: true,
+      videoId,
+      keepForever: keep,
+    });
+  });
+
+  // Remove video from user's library (soft delete)
+  api.delete("/downloads/:videoId/user", async (c: Context) => {
+    const videoId = c.req.param("videoId");
+    const userId = await getCurrentUser(c);
+
+    if (!userId) {
+      return c.json({ error: "Login required" }, 401);
+    }
+
+    // Check if user owns this video
+    const statusResult = db.getVideoUserStatus(videoId, userId);
+    if (!statusResult.ok) {
+      return c.json({ error: statusResult.error.message }, 500);
+    }
+
+    if (!statusResult.data || !statusResult.data.isOwner) {
+      return c.json({ error: "Video not in your library" }, 404);
+    }
+
+    // Mark as deleted for this user
+    const deleteResult = db.markVideoDeletedForUser(videoId, userId);
+    if (!deleteResult.ok) {
+      return c.json({ error: deleteResult.error.message }, 500);
+    }
+
+    // Check if all owners have deleted - if so, we can mark files for cleanup
+    const activeOwnerCountResult = db.getActiveOwnerCount(videoId);
+    const shouldDeleteFiles = activeOwnerCountResult.ok && activeOwnerCountResult.data === 0;
+
+    return c.json({
+      success: true,
+      videoId,
+      shouldDeleteFiles,
+      message: shouldDeleteFiles
+        ? "Video removed from all users - files will be cleaned up"
+        : "Video removed from your library",
+    });
+  });
+
   // ==========================================================================
   // Exclusions
   // ==========================================================================
@@ -593,6 +788,12 @@ export function createApiRouter(deps: ApiDependencies) {
   // ==========================================================================
 
   api.get("/downloads-html", async (c: Context) => {
+    const userId = await getCurrentUser(c);
+    
+    if (!userId) {
+      return c.html(`<li class="empty-state">Login required</li>`);
+    }
+
     const limitParam = c.req.query("limit");
     const pageParam = c.req.query("page");
 
@@ -600,7 +801,9 @@ export function createApiRouter(deps: ApiDependencies) {
     const page = pageParam ? parseInt(pageParam, 10) : 1;
     const offset = (page - 1) * limit;
 
+    // Always filter by current user for privacy
     const result = db.getDownloads({
+      userId,
       limit,
       offset,
       orderBy: "downloadedAt",
@@ -611,8 +814,8 @@ export function createApiRouter(deps: ApiDependencies) {
       return c.html(`<li class="empty-state">Error loading downloads</li>`);
     }
 
-    // Get total count for pagination
-    const countResult = db.getDownloadsCount({});
+    // Get total count for pagination (filtered by user)
+    const countResult = db.getDownloadsCount({ userId });
     const total = countResult.ok ? countResult.data : result.data.length;
 
     const pagination = { page, limit, total };

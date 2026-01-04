@@ -15,6 +15,7 @@ import { createSubscriptionWatcher } from "./services/subscription-watcher.ts";
 import { createCompanionClient, selectBestStreams, type QualityPreference } from "./services/companion-client.ts";
 import { createDownloadManager } from "./services/download-manager.ts";
 import { createMuxer } from "./services/muxer.ts";
+import { createCleanupService } from "./services/cleanup-service.ts";
 import { join } from "@std/path";
 
 // ============================================================================
@@ -107,6 +108,22 @@ async function main(): Promise<void> {
   registerCleanup("Local DB", () => localDb.close());
   log.info("Databases initialized");
 
+  // 2a. Recover orphaned downloads (items stuck in "downloading" status from previous run)
+  const orphanedDownloads = localDb.getOrphanedDownloads();
+  if (orphanedDownloads.ok && orphanedDownloads.data.length > 0) {
+    log.info("Found orphaned downloads from previous run", {
+      count: orphanedDownloads.data.length,
+      videoIds: orphanedDownloads.data.map(d => d.videoId),
+    });
+    const resetCount = localDb.resetOrphanedDownloads();
+    if (resetCount.ok) {
+      log.info(`Reset ${resetCount.data} orphaned downloads to pending for resume`);
+    }
+  }
+
+  // 2b. Clean up old tmp files (older than 7 days)
+  await cleanupOldTmpFiles(config.videosPath, 7);
+
   // 3. Initialize services
   log.info("Initializing services...");
 
@@ -141,6 +158,18 @@ async function main(): Promise<void> {
   );
   registerCleanup("Subscription Watcher", () => subscriptionWatcher.stop());
 
+  // Cleanup service (auto-delete watched subscription videos)
+  const cleanupService = createCleanupService(
+    { invidiousDb, localDb },
+    {
+      enabled: config.cleanupEnabled,
+      days: config.cleanupDays,
+      intervalHours: config.cleanupIntervalHours,
+      videosPath: config.videosPath,
+    },
+  );
+  registerCleanup("Cleanup Service", () => cleanupService.stop());
+
   log.info("Services initialized");
 
   // 4. Create and start HTTP server
@@ -148,6 +177,7 @@ async function main(): Promise<void> {
   const server = createServer({
     config,
     db: localDb,
+    invidiousDb,
     downloadManager,
     muxer,
   });
@@ -176,6 +206,15 @@ async function main(): Promise<void> {
     userId: config.invidiousUser ?? "all users",
   });
 
+  // Start cleanup service
+  cleanupService.start();
+  if (config.cleanupEnabled) {
+    log.info("Cleanup service started", {
+      cleanupDays: config.cleanupDays,
+      cleanupIntervalHours: config.cleanupIntervalHours,
+    });
+  }
+
   // Start download manager queue processor
   startQueueProcessor(downloadManager, companionClient, localDb, config, server.wsManager);
 
@@ -188,6 +227,105 @@ async function main(): Promise<void> {
 
   // Keep running
   await httpServer.finished;
+}
+
+// ============================================================================
+// Tmp File Utilities
+// ============================================================================
+
+/**
+ * Clean up old .tmp files that are older than the specified number of days.
+ * These are partial downloads that were never completed.
+ */
+async function cleanupOldTmpFiles(videosPath: string, maxAgeDays: number): Promise<void> {
+  const maxAgeMs = maxAgeDays * 24 * 60 * 60 * 1000;
+  const now = Date.now();
+  let cleanedCount = 0;
+  let cleanedBytes = 0;
+
+  try {
+    for await (const entry of Deno.readDir(videosPath)) {
+      if (entry.isFile && entry.name.endsWith(".tmp")) {
+        const filePath = join(videosPath, entry.name);
+        try {
+          const stat = await Deno.stat(filePath);
+          const fileAge = now - stat.mtime!.getTime();
+          if (fileAge > maxAgeMs) {
+            cleanedBytes += stat.size;
+            await Deno.remove(filePath);
+            cleanedCount++;
+            log.info(`Cleaned up old tmp file: ${entry.name} (${Math.round(stat.size / 1024 / 1024)}MB, ${Math.round(fileAge / 1000 / 60 / 60 / 24)} days old)`);
+          }
+        } catch (err) {
+          log.warn(`Failed to check/remove tmp file: ${entry.name}`, {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    }
+    if (cleanedCount > 0) {
+      log.info(`Cleaned up ${cleanedCount} old tmp files (${Math.round(cleanedBytes / 1024 / 1024)}MB total)`);
+    }
+  } catch (err) {
+    log.warn("Failed to scan for old tmp files", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+/**
+ * Check if partial download files exist for a video ID.
+ * Returns info about the partial files found.
+ */
+async function hasPartialDownload(
+  videoId: string,
+  videosPath: string,
+): Promise<{ hasPartial: boolean; videoTmpSize: number; audioTmpSize: number }> {
+  const videoTmpPath = join(videosPath, `${videoId}_video.tmp`);
+  const audioTmpPath = join(videosPath, `${videoId}_audio.tmp`);
+
+  let videoTmpSize = 0;
+  let audioTmpSize = 0;
+
+  try {
+    const videoStat = await Deno.stat(videoTmpPath);
+    videoTmpSize = videoStat.size;
+  } catch {
+    // File doesn't exist
+  }
+
+  try {
+    const audioStat = await Deno.stat(audioTmpPath);
+    audioTmpSize = audioStat.size;
+  } catch {
+    // File doesn't exist
+  }
+
+  return {
+    hasPartial: videoTmpSize > 0 || audioTmpSize > 0,
+    videoTmpSize,
+    audioTmpSize,
+  };
+}
+
+/**
+ * Delete partial download files for a video ID.
+ */
+async function deletePartialDownload(videoId: string, videosPath: string): Promise<void> {
+  const videoTmpPath = join(videosPath, `${videoId}_video.tmp`);
+  const audioTmpPath = join(videosPath, `${videoId}_audio.tmp`);
+
+  try {
+    await Deno.remove(videoTmpPath);
+  } catch {
+    // File doesn't exist
+  }
+
+  try {
+    await Deno.remove(audioTmpPath);
+  } catch {
+    // File doesn't exist
+  }
 }
 
 // ============================================================================
@@ -412,11 +550,27 @@ function startQueueProcessor(
         return;
       }
 
-      // Start download
-      log.info("Starting download", {
-        videoId: queueItem.videoId,
-        title: videoInfo.title,
-      });
+      // Check for partial downloads (from interrupted downloads)
+      const partial = await hasPartialDownload(queueItem.videoId, config.videosPath);
+      const shouldResume = partial.hasPartial;
+      
+      if (shouldResume) {
+        const videoMB = Math.round(partial.videoTmpSize / 1024 / 1024);
+        const audioMB = Math.round(partial.audioTmpSize / 1024 / 1024);
+        log.info("Resuming interrupted download", {
+          videoId: queueItem.videoId,
+          title: videoInfo.title,
+          videoTmpSize: `${videoMB}MB`,
+          audioTmpSize: `${audioMB}MB`,
+        });
+        wsManager.broadcastToast(`Resuming: "${videoInfo.title}" (${videoMB}MB video, ${audioMB}MB audio)`, "success");
+      } else {
+        // Start fresh download
+        log.info("Starting download", {
+          videoId: queueItem.videoId,
+          title: videoInfo.title,
+        });
+      }
 
       // Initialize progress tracking
       downloadManager.updateProgress(
@@ -436,6 +590,12 @@ function startQueueProcessor(
         streams,
         outputDir: config.videosPath,
         rateLimit: config.downloadRateLimit,
+        resume: shouldResume,
+        // Throttle detection config (only enabled if threshold > 0)
+        throttleConfig: config.throttleSpeedThreshold > 0 ? {
+          speedThreshold: config.throttleSpeedThreshold,
+          detectionWindow: config.throttleDetectionWindow,
+        } : undefined,
         onProgress: (progress) => {
           // Update progress in manager for API access
           downloadManager.updateProgress(
@@ -464,6 +624,56 @@ function startQueueProcessor(
       downloadManager.removeProgress(queueItem.videoId);
 
       if (!downloadResult.ok) {
+        // Check for resume-specific errors
+        const cause = downloadResult.error.cause as { urlExpired?: boolean; startFresh?: boolean; throttled?: boolean } | undefined;
+        
+        // Check for throttling - handle with separate retry counter
+        if (cause?.throttled) {
+          const throttleRetries = queueItem.throttleRetryCount + 1;
+          
+          if (throttleRetries >= config.throttleMaxRetries) {
+            // Max throttle retries reached - continue downloading at slow speed
+            // (don't abort, just log and let normal retry logic handle it)
+            log.warn("Throttle detection max retries reached, continuing at slow speed", {
+              videoId: queueItem.videoId,
+              throttleRetries,
+              maxThrottleRetries: config.throttleMaxRetries,
+            });
+            wsManager.broadcastToast(
+              `Max throttle retries (${config.throttleMaxRetries}) reached for "${videoInfo.title}", continuing at slow speed`,
+              "warning",
+            );
+            // Fall through to normal error handling
+          } else {
+            // Throttle detected - retry with fresh URLs
+            log.info("Throttling detected, retrying with fresh URLs", {
+              videoId: queueItem.videoId,
+              throttleRetry: throttleRetries,
+              maxThrottleRetries: config.throttleMaxRetries,
+            });
+            localDb.incrementThrottleRetry(queueItem.videoId);
+            wsManager.broadcastToast(
+              `Throttling detected for "${videoInfo.title}", retry ${throttleRetries}/${config.throttleMaxRetries}`,
+              "warning",
+            );
+            broadcastDashboardUpdate(wsManager, localDb, downloadManager);
+            return;
+          }
+        }
+        
+        if (cause?.startFresh && shouldResume) {
+          // Server doesn't support resume - delete tmp files and retry immediately
+          log.info("Server doesn't support resume, restarting download fresh", {
+            videoId: queueItem.videoId,
+          });
+          await deletePartialDownload(queueItem.videoId, config.videosPath);
+          // Don't count this as a retry - just let it retry on next cycle with fresh start
+          localDb.updateQueueStatus(queueItem.videoId, "pending");
+          wsManager.broadcastToast(`Restarting download (no resume support): "${videoInfo.title}"`, "warning");
+          return;
+        }
+        
+        // URL expired is handled normally - we get fresh URLs each time anyway
         log.error("Download failed", {
           videoId: queueItem.videoId,
           error: downloadResult.error.message,

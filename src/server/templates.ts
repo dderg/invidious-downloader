@@ -155,6 +155,11 @@ export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgre
     statusClass = "retry";
     const retryTime = formatTime(item.nextRetryAt);
     retryInfo = `Retry ${item.retryCount}/3 scheduled for ${retryTime}`;
+  } else if (item.status === "downloading" && !progress) {
+    // Stuck in downloading without active progress - interrupted download
+    statusDisplay = "interrupted";
+    statusClass = "interrupted";
+    retryInfo = "Download was interrupted";
   } else if (item.status === "failed") {
     // Failed - show attempt count if retried
     if (item.retryCount > 0) {
@@ -185,8 +190,12 @@ export function renderQueueItem(item: QueueItem, progress?: ActiveDownloadProgre
   </div>
   <span class="item-status status-${statusClass}">${statusDisplay}</span>
   <div class="item-actions">
-    ${item.status === "pending" || item.status === "downloading" ? `
+    ${item.status === "pending" || (item.status === "downloading" && progress) ? `
       <button class="secondary" hx-delete="/api/downloader/queue/${item.videoId}" hx-swap="none">Cancel</button>
+    ` : ""}
+    ${item.status === "downloading" && !progress ? `
+      <button hx-post="/api/downloader/queue/${item.videoId}/retry" hx-swap="none" title="Resume from where it stopped">Resume</button>
+      <button class="secondary" hx-post="/api/downloader/queue/${item.videoId}/retry?fresh=true" hx-swap="none" title="Delete partial files and start over">Restart</button>
     ` : ""}
     ${item.status === "failed" ? `
       <button hx-post="/api/downloader/queue" hx-vals='{"videoId":"${item.videoId}"}' hx-swap="none">Retry</button>
@@ -398,6 +407,75 @@ export interface DashboardData {
   progress: Map<string, ActiveDownloadProgress>;
   downloads: DownloadWithStatus[];
   downloadsPagination: Pagination;
+  /** Current user's email if logged in, null otherwise */
+  userId?: string | null;
+}
+
+/**
+ * Render login required page HTML.
+ */
+export function renderLoginRequired(): string {
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Login Required - Invidious Downloader</title>
+  <style>
+    :root {
+      --bg: #1a1a2e;
+      --bg-card: #16213e;
+      --text: #eee;
+      --text-muted: #888;
+      --accent: #e94560;
+      --border: #333;
+    }
+    
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    
+    .login-card {
+      background: var(--bg-card);
+      border-radius: 12px;
+      border: 1px solid var(--border);
+      padding: 40px;
+      text-align: center;
+      max-width: 400px;
+    }
+    
+    h1 { font-size: 24px; margin-bottom: 16px; }
+    p { color: var(--text-muted); margin-bottom: 24px; }
+    
+    a {
+      display: inline-block;
+      padding: 12px 24px;
+      border-radius: 8px;
+      background: var(--accent);
+      color: white;
+      text-decoration: none;
+      font-weight: 500;
+    }
+    
+    a:hover { opacity: 0.9; }
+  </style>
+</head>
+<body>
+  <div class="login-card">
+    <h1>Login Required</h1>
+    <p>Please log in to Invidious to view your downloads and manage your video library.</p>
+    <a href="/">Go to Invidious</a>
+  </div>
+</body>
+</html>`;
 }
 
 /**
@@ -664,6 +742,7 @@ export function renderDashboardPage(data: DashboardData): string {
     .status-cancelled { background: var(--border); color: var(--text); }
     .status-muxing { background: #9c27b0; color: #fff; }
     .status-retry { background: #ff9800; color: #000; }
+    .status-interrupted { background: #ff5722; color: #fff; }
     
     .error-text {
       color: var(--error);

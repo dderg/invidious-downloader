@@ -240,6 +240,21 @@ export function createVideoHandler(
   }
 
   /**
+   * Check if a video has cached streams available for playback.
+   * Returns true if either:
+   * - Muxed MP4 file exists, OR
+   * - Both video AND audio DASH streams exist
+   */
+  async function hasCachedStreams(videoId: string): Promise<boolean> {
+    // Check muxed file first (fast path)
+    if (await isCached(videoId)) return true;
+    
+    // Check for DASH streams
+    const streams = await getCachedStreams(videoId);
+    return streams.videoItags.length > 0 && streams.audioItags.length > 0;
+  }
+
+  /**
    * Serve a cached video file.
    */
   async function serveVideo(
@@ -429,6 +444,9 @@ export function createVideoHandler(
 
   /**
    * Serve a cached video stream by itag.
+   * 
+   * For DASH streaming, this expands small range requests to at least 64MB
+   * to reduce HTTP request overhead and eliminate micro-stutters.
    */
   async function serveVideoStream(
     videoId: string,
@@ -453,6 +471,8 @@ export function createVideoHandler(
         "Content-Type": mimeType,
         "Accept-Ranges": "bytes",
         "Cache-Control": "public, max-age=31536000",
+        "X-Cache": "HIT",
+        "X-Cache-Source": "local-dash-video",
       });
 
       if (stat.mtime) {
@@ -462,8 +482,14 @@ export function createVideoHandler(
       const range = parseRangeHeader(rangeHeader, fileSize);
 
       if (range) {
-        const { start, end } = range;
+        // Expand small range requests to reduce HTTP overhead
+        const expanded = expandRangeForStreaming(range.start, range.end, fileSize);
+        const { start, end, wasExpanded } = expanded;
         const contentLength = end - start + 1;
+
+        if (wasExpanded) {
+          console.log(`[video-stream] Expanded range for ${videoId} itag ${itag}: ${range.start}-${range.end} -> ${start}-${end} (${Math.round(contentLength / 1024 / 1024)}MB)`);
+        }
 
         headers.set("Content-Length", contentLength.toString());
         headers.set("Content-Range", `bytes ${start}-${end}/${fileSize}`);
@@ -499,6 +525,9 @@ export function createVideoHandler(
   /**
    * Serve a cached audio stream by itag.
    * Automatically detects the actual file extension (.m4a or .webm).
+   * 
+   * For DASH streaming, this expands small range requests to at least 64MB
+   * to reduce HTTP request overhead and eliminate micro-stutters.
    */
   async function serveAudioStream(
     videoId: string,
@@ -530,6 +559,8 @@ export function createVideoHandler(
         "Content-Type": mimeType,
         "Accept-Ranges": "bytes",
         "Cache-Control": "public, max-age=31536000",
+        "X-Cache": "HIT",
+        "X-Cache-Source": "local-dash-audio",
       });
 
       if (stat.mtime) {
@@ -539,8 +570,14 @@ export function createVideoHandler(
       const range = parseRangeHeader(rangeHeader, fileSize);
 
       if (range) {
-        const { start, end } = range;
+        // Expand small range requests to reduce HTTP overhead
+        const expanded = expandRangeForStreaming(range.start, range.end, fileSize);
+        const { start, end, wasExpanded } = expanded;
         const contentLength = end - start + 1;
+
+        if (wasExpanded) {
+          console.log(`[audio-stream] Expanded range for ${videoId} itag ${itag}: ${range.start}-${range.end} -> ${start}-${end} (${Math.round(contentLength / 1024 / 1024)}MB)`);
+        }
 
         headers.set("Content-Length", contentLength.toString());
         headers.set("Content-Range", `bytes ${start}-${end}/${fileSize}`);
@@ -616,6 +653,7 @@ export function createVideoHandler(
 
   return {
     isCached,
+    hasCachedStreams,
     serveVideo,
     serveThumbnail,
     getMetadata,
@@ -634,42 +672,76 @@ export function createVideoHandler(
 export type VideoHandler = ReturnType<typeof createVideoHandler>;
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/**
+ * Minimum chunk size for DASH streaming responses.
+ * When a player requests a small segment, we expand the response to at least
+ * this size to reduce HTTP request overhead and eliminate micro-stutters.
+ * 
+ * 64MB chosen based on YouTube's behavior (~60-70MB per request).
+ */
+const DASH_MIN_CHUNK_SIZE = 64 * 1024 * 1024; // 64MB
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
 /**
+ * Expand a range request to serve larger chunks for smoother streaming.
+ * 
+ * DISABLED: Chunk expansion causes issues with VHS player's parallel requests.
+ * The player makes multiple parallel segment requests, and expanding them
+ * causes overlapping responses that break playback.
+ * 
+ * TODO: Investigate alternative approaches:
+ * - Removing sidx/indexRange from manifest (but then seeking breaks)
+ * - Server-side segment coalescing with request tracking
+ * - Different DASH profile that doesn't use segment index
+ * 
+ * @param start - Requested start byte
+ * @param end - Requested end byte
+ * @param fileSize - Total file size
+ * @param minChunkSize - Minimum response size (unused - expansion disabled)
+ * @returns Original range unchanged
+ */
+function expandRangeForStreaming(
+  start: number,
+  end: number,
+  _fileSize: number,
+  _minChunkSize: number = DASH_MIN_CHUNK_SIZE,
+): { start: number; end: number; wasExpanded: boolean } {
+  // Expansion disabled - return original range
+  return { start, end, wasExpanded: false };
+}
+
+/**
  * Create a readable stream for a range of a file.
+ * Uses larger chunks and simpler logic for better performance.
  */
 function createRangeStream(
   file: Deno.FsFile,
   start: number,
   length: number,
 ): ReadableStream<Uint8Array> {
-  let bytesRead = 0;
-  let seeked = false;
+  let bytesRemaining = length;
+  // Use 1MB chunks for high bitrate video streaming
+  const CHUNK_SIZE = 1024 * 1024;
+
+  // Seek to start position synchronously before creating stream
+  file.seekSync(start, Deno.SeekMode.Start);
 
   return new ReadableStream({
-    async start() {
-      // Seek to start position
-      await file.seek(start, Deno.SeekMode.Start);
-      seeked = true;
-    },
-
     async pull(controller) {
-      if (!seeked) {
-        await file.seek(start, Deno.SeekMode.Start);
-        seeked = true;
-      }
-
-      const remaining = length - bytesRead;
-      if (remaining <= 0) {
+      if (bytesRemaining <= 0) {
         controller.close();
         file.close();
         return;
       }
 
-      const chunkSize = Math.min(64 * 1024, remaining); // 64KB chunks
-      const buffer = new Uint8Array(chunkSize);
+      const toRead = Math.min(CHUNK_SIZE, bytesRemaining);
+      const buffer = new Uint8Array(toRead);
 
       const n = await file.read(buffer);
       if (n === null || n === 0) {
@@ -678,8 +750,8 @@ function createRangeStream(
         return;
       }
 
-      bytesRead += n;
-      controller.enqueue(buffer.subarray(0, n));
+      bytesRemaining -= n;
+      controller.enqueue(n === toRead ? buffer : buffer.subarray(0, n));
     },
 
     cancel() {

@@ -43,6 +43,11 @@ export interface Channel {
 // ============================================================================
 
 /**
+ * Download source type.
+ */
+export type DownloadSource = "subscription" | "manual";
+
+/**
  * Downloaded video record.
  */
 export interface Download {
@@ -57,6 +62,25 @@ export interface Download {
   metadata: DownloadMetadata;
   downloadedAt: Date;
   fileSizeBytes: number;
+  /** How this video was downloaded */
+  source: DownloadSource;
+  /** When files were deleted by cleanup (null = files exist) */
+  filesDeletedAt: Date | null;
+}
+
+/**
+ * Video ownership and status per user.
+ */
+export interface VideoUserStatus {
+  videoId: string;
+  userId: string;
+  /** User was subscribed when video was downloaded */
+  isOwner: boolean;
+  /** User wants to keep this video forever (no auto-delete) */
+  keepForever: boolean;
+  /** When user "deleted" this video from their view (null = active) */
+  deletedAt: Date | null;
+  createdAt: Date;
 }
 
 /**
@@ -122,6 +146,9 @@ export interface QueueItem {
   completedAt: Date | null;
   retryCount: number;
   nextRetryAt: Date | null;
+  source: DownloadSource;
+  /** Separate retry counter for throttle-related failures */
+  throttleRetryCount: number;
 }
 
 // ============================================================================

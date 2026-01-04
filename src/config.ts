@@ -20,6 +20,16 @@ export interface Config {
   maxConcurrentDownloads: number;
   maxRetryAttempts: number; // max automatic retries before permanent failure
   retryBaseDelayMinutes: number; // base delay for exponential backoff (1 → 4 → 16 min)
+  
+  // Cleanup settings
+  cleanupEnabled: boolean;
+  cleanupDays: number; // days after which watched subscription videos can be deleted
+  cleanupIntervalHours: number; // how often to run cleanup check
+  
+  // Throttle detection
+  throttleSpeedThreshold: number; // bytes/sec - abort if speed falls below this (default: 100KB/s)
+  throttleDetectionWindow: number; // seconds to measure rolling average (default: 30)
+  throttleMaxRetries: number; // separate retry counter for throttle failures (default: 5)
 }
 
 export interface ConfigInput {
@@ -36,6 +46,14 @@ export interface ConfigInput {
   MAX_CONCURRENT_DOWNLOADS?: string;
   MAX_RETRY_ATTEMPTS?: string;
   RETRY_BASE_DELAY_MINUTES?: string;
+  // Cleanup settings
+  CLEANUP_ENABLED?: string;
+  CLEANUP_DAYS?: string;
+  CLEANUP_INTERVAL_HOURS?: string;
+  // Throttle detection
+  THROTTLE_SPEED_THRESHOLD?: string;
+  THROTTLE_DETECTION_WINDOW?: string;
+  THROTTLE_MAX_RETRIES?: string;
 }
 
 export class ConfigError extends Error {
@@ -140,6 +158,55 @@ export function parseConfig(input: ConfigInput): ConfigResult {
     errors.push(retryBaseDelayMinutes.error);
   }
 
+  // Cleanup settings
+  const cleanupEnabled = parseBoolean(input.CLEANUP_ENABLED, false);
+  
+  const cleanupDays = parsePositiveInt(
+    input.CLEANUP_DAYS,
+    "CLEANUP_DAYS",
+    14,
+  );
+  if (cleanupDays.error) {
+    errors.push(cleanupDays.error);
+  }
+
+  const cleanupIntervalHours = parsePositiveInt(
+    input.CLEANUP_INTERVAL_HOURS,
+    "CLEANUP_INTERVAL_HOURS",
+    24,
+  );
+  if (cleanupIntervalHours.error) {
+    errors.push(cleanupIntervalHours.error);
+  }
+
+  // Throttle detection settings
+  const throttleSpeedThreshold = parseNonNegativeInt(
+    input.THROTTLE_SPEED_THRESHOLD,
+    "THROTTLE_SPEED_THRESHOLD",
+    102400, // 100KB/s default
+  );
+  if (throttleSpeedThreshold.error) {
+    errors.push(throttleSpeedThreshold.error);
+  }
+
+  const throttleDetectionWindow = parsePositiveInt(
+    input.THROTTLE_DETECTION_WINDOW,
+    "THROTTLE_DETECTION_WINDOW",
+    30,
+  );
+  if (throttleDetectionWindow.error) {
+    errors.push(throttleDetectionWindow.error);
+  }
+
+  const throttleMaxRetries = parsePositiveInt(
+    input.THROTTLE_MAX_RETRIES,
+    "THROTTLE_MAX_RETRIES",
+    5,
+  );
+  if (throttleMaxRetries.error) {
+    errors.push(throttleMaxRetries.error);
+  }
+
   if (errors.length > 0) {
     return { ok: false, errors };
   }
@@ -160,6 +227,12 @@ export function parseConfig(input: ConfigInput): ConfigResult {
       maxConcurrentDownloads: maxConcurrentDownloads.value!,
       maxRetryAttempts: maxRetryAttempts.value!,
       retryBaseDelayMinutes: retryBaseDelayMinutes.value!,
+      cleanupEnabled,
+      cleanupDays: cleanupDays.value!,
+      cleanupIntervalHours: cleanupIntervalHours.value!,
+      throttleSpeedThreshold: throttleSpeedThreshold.value!,
+      throttleDetectionWindow: throttleDetectionWindow.value!,
+      throttleMaxRetries: throttleMaxRetries.value!,
     },
   };
 }
@@ -183,6 +256,12 @@ export function loadConfigFromEnv(): ConfigResult {
     MAX_CONCURRENT_DOWNLOADS: Deno.env.get("MAX_CONCURRENT_DOWNLOADS"),
     MAX_RETRY_ATTEMPTS: Deno.env.get("MAX_RETRY_ATTEMPTS"),
     RETRY_BASE_DELAY_MINUTES: Deno.env.get("RETRY_BASE_DELAY_MINUTES"),
+    CLEANUP_ENABLED: Deno.env.get("CLEANUP_ENABLED"),
+    CLEANUP_DAYS: Deno.env.get("CLEANUP_DAYS"),
+    CLEANUP_INTERVAL_HOURS: Deno.env.get("CLEANUP_INTERVAL_HOURS"),
+    THROTTLE_SPEED_THRESHOLD: Deno.env.get("THROTTLE_SPEED_THRESHOLD"),
+    THROTTLE_DETECTION_WINDOW: Deno.env.get("THROTTLE_DETECTION_WINDOW"),
+    THROTTLE_MAX_RETRIES: Deno.env.get("THROTTLE_MAX_RETRIES"),
   });
 }
 
@@ -253,6 +332,17 @@ function parsePositiveInt(
   }
 
   return { value: num };
+}
+
+function parseBoolean(
+  value: string | undefined,
+  defaultValue: boolean,
+): boolean {
+  if (!value || value.trim() === "") {
+    return defaultValue;
+  }
+  const lower = value.trim().toLowerCase();
+  return lower === "true" || lower === "1" || lower === "yes";
 }
 
 /**

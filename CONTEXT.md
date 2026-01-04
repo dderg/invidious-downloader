@@ -98,3 +98,38 @@ For cached videos with DASH streams:
 - `adaptiveFormats` → filtered to only cached itags, URLs rewritten to local endpoints
 - `dashUrl` → cleared (we serve streams directly, not through a manifest URL)
 - `formatStreams` → NOT modified (kept from original response)
+
+## Design Decisions & Constraints
+
+### Why DASH (not progressive MP4)
+- **Invidious UI requests DASH** - The web player and clients like Yattee use DASH/adaptive streaming
+- **We don't modify Invidious UI** - Must remain compatible with standard Invidious frontends
+- **SponsorBlock integration** - Works with DASH playback, may not work with progressive
+- The muxed MP4 is only for external consumers (Jellyfin, direct downloads)
+
+### Known Issue: DASH Playback Stuttering
+**Problem:** When playing cached DASH streams, playback stutters every 3-6 seconds even though chunks are buffered ahead.
+
+**Root Cause Analysis:**
+1. Downloaded video files are fragmented MP4 (fMP4) with `sidx` atom containing segment index
+2. Our DASH manifest provides `indexRange` pointing to the `sidx`
+3. The Invidious player (dash.js) parses the `sidx` and sees 643 segments (~5.5s each)
+4. Player requests segments one at a time, causing micro-stutter at each segment boundary
+5. YouTube's player requests 60-70MB chunks (multiple segments batched), ours requests ~5-18MB per segment
+
+**What we tried:**
+- Increasing `minBufferTime` in manifest (10s, 30s) - didn't help, player still requests per-segment
+- Removing `indexRange` from manifest - player then downloads entire file (1GB+) at once
+- Increasing chunk size in file streaming (1MB) - didn't help, issue is request pattern not streaming
+
+**Potential solutions to explore:**
+1. Investigate dash.js configuration in Invidious - may have settings for segment batching
+2. Check if there's a different DASH profile that encourages larger requests
+3. Look at how YouTube's DASH manifest differs from ours
+4. Consider if we can inject player configuration without modifying Invidious UI
+
+### Cache Detection
+- `isCached(videoId)` - checks for muxed `.mp4` file only
+- `hasCachedStreams(videoId)` - checks for muxed MP4 OR (video + audio DASH streams)
+- API transformation uses `hasCachedStreams()` to handle DASH-only cached videos
+

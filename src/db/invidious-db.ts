@@ -248,6 +248,65 @@ export function buildGetMaxPublishedQuery(channelIds: string[]): {
   };
 }
 
+/**
+ * Build query to get user email from session ID.
+ */
+export function buildGetUserBySessionIdQuery(sessionId: string): {
+  sql: string;
+  params: unknown[];
+} {
+  return {
+    sql: `SELECT email FROM session_ids WHERE id = $1`,
+    params: [sessionId],
+  };
+}
+
+/**
+ * Build query to check if a user has watched a video.
+ */
+export function buildHasUserWatchedVideoQuery(userId: string, videoId: string): {
+  sql: string;
+  params: unknown[];
+} {
+  return {
+    sql: `SELECT $2 = ANY(watched) as watched FROM users WHERE email = $1`,
+    params: [userId, videoId],
+  };
+}
+
+/**
+ * Build query to get which videos from a list a user has watched.
+ */
+export function buildGetWatchedVideoIdsQuery(userId: string, videoIds: string[]): {
+  sql: string;
+  params: unknown[];
+} {
+  if (videoIds.length === 0) {
+    return { sql: "SELECT NULL as video_id WHERE false", params: [] };
+  }
+  return {
+    sql: `
+      SELECT unnest(watched) as video_id 
+      FROM users 
+      WHERE email = $1 AND watched && $2
+    `,
+    params: [userId, videoIds],
+  };
+}
+
+/**
+ * Build query to get all users subscribed to a channel.
+ */
+export function buildGetUsersSubscribedToChannelQuery(channelId: string): {
+  sql: string;
+  params: unknown[];
+} {
+  return {
+    sql: `SELECT email FROM users WHERE $1 = ANY(subscriptions)`,
+    params: [channelId],
+  };
+}
+
 // ============================================================================
 // Invidious Database Client
 // ============================================================================
@@ -412,6 +471,97 @@ export function createInvidiousDb(executor: SqlExecutor) {
   }
 
   /**
+   * Get user email from session ID.
+   * Returns null if session is invalid or expired.
+   */
+  async function getUserBySessionId(sessionId: string): Promise<DbResult<string | null>> {
+    try {
+      const { sql, params } = buildGetUserBySessionIdQuery(sessionId);
+      const row = await executor.queryOne(sql, params);
+      
+      if (!row || !row.email) {
+        return { ok: true, data: null };
+      }
+      
+      return { ok: true, data: String(row.email) };
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to get user by session ID: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Check if a user has watched a specific video.
+   */
+  async function hasUserWatchedVideo(userId: string, videoId: string): Promise<DbResult<boolean>> {
+    try {
+      const { sql, params } = buildHasUserWatchedVideoQuery(userId, videoId);
+      const row = await executor.queryOne(sql, params);
+      
+      if (!row) {
+        return { ok: true, data: false };
+      }
+      
+      return { ok: true, data: Boolean(row.watched) };
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to check if user watched video: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Get list of video IDs that a user has watched from a given list.
+   */
+  async function getWatchedVideoIds(userId: string, videoIds: string[]): Promise<DbResult<string[]>> {
+    try {
+      if (videoIds.length === 0) {
+        return { ok: true, data: [] };
+      }
+      
+      const { sql, params } = buildGetWatchedVideoIdsQuery(userId, videoIds);
+      const rows = await executor.queryRows(sql, params);
+      
+      // Filter to only include videos from our input list
+      const videoIdSet = new Set(videoIds);
+      const watchedIds = rows
+        .map((r) => String(r.video_id))
+        .filter((id) => videoIdSet.has(id));
+      
+      return { ok: true, data: watchedIds };
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to get watched video IDs: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
+   * Get all users subscribed to a specific channel.
+   */
+  async function getUsersSubscribedToChannel(channelId: string): Promise<DbResult<string[]>> {
+    try {
+      const { sql, params } = buildGetUsersSubscribedToChannelQuery(channelId);
+      const rows = await executor.queryRows(sql, params);
+      
+      return { ok: true, data: rows.map((r) => String(r.email)) };
+    } catch (error) {
+      return errorResult(
+        "query_error",
+        `Failed to get users subscribed to channel: ${error instanceof Error ? error.message : "Unknown error"}`,
+        error,
+      );
+    }
+  }
+
+  /**
    * Close the database connection.
    */
   async function close(): Promise<void> {
@@ -426,6 +576,10 @@ export function createInvidiousDb(executor: SqlExecutor) {
     getChannel,
     getChannels,
     getMaxPublishedTimestamp,
+    getUserBySessionId,
+    hasUserWatchedVideo,
+    getWatchedVideoIds,
+    getUsersSubscribedToChannel,
     close,
   };
 }
